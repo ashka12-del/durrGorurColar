@@ -1,143 +1,151 @@
 from __future__ import annotations
 
-import random
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
-from mock_data.generator import Cow
-from pages.dashboard import TrendChart
 from styles.theme import ACCENT, DANGER, INFO, MUTED, WARNING
-from widgets.common import PageHeader, StatCard
-from widgets.map_widget import MockMap
+from widgets.common import PageHeader
+from widgets.map_widget import TelemetryMap
 
 
 class MapPage(QWidget):
-    def __init__(self, cows: list[Cow], fence_mode: bool = False) -> None:
+    fence_submitted = Signal(float, float, float)
+    fence_previewed = Signal(float, float, float)
+
+    def __init__(self) -> None:
         super().__init__()
-        self.fence_mode = fence_mode
         root = QVBoxLayout(self)
-        root.addWidget(PageHeader("Virtual fence" if fence_mode else "GPS map", "Interactive simulated pasture view — drag to pan and scroll to zoom."))
-        if fence_mode:
-            stats = QHBoxLayout()
-            stats.addWidget(StatCard("Fence area", "2.4 acres", "⬡", ACCENT, "Mock polygon"))
-            stats.addWidget(StatCard("Cattle inside", "5", "✓", ACCENT, "Safe zone"))
-            stats.addWidget(StatCard("Outside", "1", "!", DANGER, "Simulated breach"))
-            root.addLayout(stats)
-        self.map = MockMap()
-        self.map.set_cows(cows)
+        root.addWidget(PageHeader("GPS Map", "Live cattle position and interactive virtual-fence control."))
         frame = QFrame(objectName="card")
         layout = QVBoxLayout(frame)
+        self.summary = QLabel("Waiting for GPS telemetry…")
+        self.summary.setObjectName("muted")
+        self.map = TelemetryMap()
+        self.map.fence_previewed.connect(self.fence_previewed.emit)
+        self.map.fence_dropped.connect(self._fence_moved)
+        self.hint = QLabel("Hover red dot for GPS coordinates  •  Hover fence edge for radius and distance")
+        self.hint.setStyleSheet(f"color:{MUTED};font-weight:700")
+        controls = QHBoxLayout()
+        controls.addStretch()
+        self.edit_button = QPushButton("Edit Fence")
+        self.edit_button.clicked.connect(self._begin_edit)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self._cancel_edit)
+        self.cancel_button.setVisible(False)
+        self.update_button = QPushButton("Update Fence")
+        self.update_button.setObjectName("primary")
+        self.update_button.clicked.connect(self._apply_edit)
+        self.update_button.setVisible(False)
+        controls.addWidget(self.edit_button)
+        controls.addWidget(self.cancel_button)
+        controls.addWidget(self.update_button)
+        self._original_fence: tuple[float, float, float] | None = None
+        layout.addWidget(self.summary)
+        layout.addWidget(self.hint)
+        layout.addLayout(controls)
         layout.addWidget(self.map)
         root.addWidget(frame)
 
-    def update_cows(self, cows: list[Cow]) -> None:
-        self.map.set_cows(cows)
+    def update_telemetry(self, data: dict) -> None:
+        self.map.set_telemetry(data)
+        if data.get("latitude") is not None and data.get("longitude") is not None:
+            self.summary.setText(f"{float(data['latitude']):.6f}, {float(data['longitude']):.6f}  •  {data.get('fence_status', 'Unknown')}")
+
+    def set_fence(self, latitude: float, longitude: float, radius: float) -> None:
+        self.map.set_fence(latitude, longitude, radius)
+
+    def _begin_edit(self) -> None:
+        self._original_fence = self.map.fence
+        self.map.set_editable(True)
+        self.edit_button.setVisible(False)
+        self.cancel_button.setVisible(True)
+        self.update_button.setVisible(True)
+        self.update_button.setEnabled(False)
+        self.hint.setText("EDIT MODE  •  Drag the green fence, then select Update Fence  •  Hover markers for details")
+
+    def _fence_moved(self, _latitude: float, _longitude: float, _radius: float) -> None:
+        self.update_button.setEnabled(True)
+
+    def _apply_edit(self) -> None:
+        if self.map.fence:
+            self.fence_submitted.emit(*self.map.fence)
+        self._finish_edit()
+
+    def _cancel_edit(self) -> None:
+        if self._original_fence:
+            self.map.set_fence(*self._original_fence)
+            self.fence_previewed.emit(*self._original_fence)
+        self._finish_edit()
+
+    def _finish_edit(self) -> None:
+        self.map.set_editable(False)
+        self.edit_button.setVisible(True)
+        self.cancel_button.setVisible(False)
+        self.update_button.setVisible(False)
+        self.hint.setText("Hover red dot for GPS coordinates  •  Hover fence edge for radius and distance")
+        self._original_fence = None
 
 
 class AlertsPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
         root = QVBoxLayout(self)
-        root.addWidget(PageHeader("Alerts", "Prioritized mock events from across the herd."))
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Time", "Cow", "Alert", "Severity", "Status"])
+        root.addWidget(PageHeader("Alerts", "Fence breaches, abnormal temperature, and ESP32 system notifications."))
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Time", "Type", "Message", "Severity"])
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         root.addWidget(self.table)
-        samples = [("Rani", "Fence Crossed", "Critical"), ("Chandni", "High Temperature", "Warning"), ("Rani", "GPS Lost", "Critical"), ("Shorna", "Battery Low", "Warning"), ("Maya", "SIM Offline", "Info")]
-        for i, sample in enumerate(samples):
-            self.add_alert({"cow": sample[0], "alert": sample[1], "severity": sample[2]}, datetime.now() - timedelta(minutes=i * 17))
 
-    def add_alert(self, alert: dict, when: datetime | None = None) -> None:
+    def add_alert(self, alert: dict) -> None:
         self.table.insertRow(0)
-        values = [(when or datetime.now()).strftime("%I:%M %p"), alert["cow"], alert["alert"], alert["severity"], "New" if alert["severity"] == "Critical" else "Reviewed"]
+        values = [alert.get("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S")), alert.get("type", "System"), alert.get("message", "Notification"), alert.get("severity", "Info")]
         for column, value in enumerate(values):
             item = QTableWidgetItem(str(value))
-            if column == 3:
-                item.setForeground(QColor({"Critical": DANGER, "Warning": WARNING}.get(str(value), INFO)))
+            if column == 3: item.setForeground(QColor({"Critical": DANGER, "Warning": WARNING}.get(str(value), INFO)))
             self.table.setItem(0, column, item)
 
 
-class DeviceStatusPage(QWidget):
+class HistoryPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
         root = QVBoxLayout(self)
-        root.addWidget(PageHeader("Device status", "Visual mock states only — no hardware is queried."))
-        grid = QGridLayout()
-        devices = [("ESP32", "Online", "MCU"), ("GPS", "Online", "Satellite lock"), ("MPU6050", "Online", "Motion"), ("DS18B20", "Degraded", "Temperature"), ("SIM800L", "Offline", "Cellular"), ("Battery", "Online", "Power")]
-        for i, (name, state, role) in enumerate(devices):
-            color = ACCENT if state == "Online" else WARNING if state == "Degraded" else DANGER
-            grid.addWidget(StatCard(name, state, "●", color, f"{role} • simulated"), i // 3, i % 3)
-        root.addLayout(grid)
-        root.addStretch()
+        root.addWidget(PageHeader("History", "Telemetry and alert records received during this session."))
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Time", "Record", "Latitude", "Longitude", "Altitude", "Temperature", "Details"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        root.addWidget(self.table)
 
+    def add_telemetry(self, data: dict) -> None:
+        motion = f"Accel X/Y/Z: {data.get('acceleration_x', '—')}, {data.get('acceleration_y', '—')}, {data.get('acceleration_z', '—')} g"
+        self._add([data.get("received_at", ""), "Telemetry", data.get("latitude", "—"), data.get("longitude", "—"), data.get("altitude", "—"), data.get("temperature", "—"), f"Fence: {data.get('fence_status', 'Unknown')} • {motion}"])
 
-class AnalyticsPage(QWidget):
-    def __init__(self, title: str = "Analytics") -> None:
-        super().__init__()
-        root = QVBoxLayout(self)
-        root.addWidget(PageHeader(title, "Generated datasets make trends feel realistic without storing any records."))
-        grid = QGridLayout()
-        for i, (name, color) in enumerate([("Battery trend", ACCENT), ("Temperature", WARNING), ("Movement", INFO), ("Alerts", DANGER)]):
-            card = QFrame(objectName="card")
-            layout = QVBoxLayout(card)
-            label = QLabel(name); label.setStyleSheet("font-size:16px;font-weight:700")
-            chart = TrendChart(color); chart.values = [random.randint(25, 92) for _ in range(12)]
-            layout.addWidget(label); layout.addWidget(chart)
-            grid.addWidget(card, i // 2, i % 2)
-        root.addLayout(grid)
+    def add_alert(self, alert: dict) -> None:
+        self._add([alert.get("time", ""), "Alert", "—", "—", "—", "—", alert.get("message", "")])
 
-
-class SettingsPage(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        root = QVBoxLayout(self)
-        root.addWidget(PageHeader("Settings", "Frontend controls for demonstration; values are not persisted."))
-        panel = QFrame(objectName="card")
-        grid = QGridLayout(panel)
-        controls = [("Dark mode", QCheckBox()), ("Notifications", QCheckBox()), ("Sound alerts", QCheckBox())]
-        for i, (label, control) in enumerate(controls):
-            control.setChecked(True)
-            grid.addWidget(QLabel(label), i, 0); grid.addWidget(control, i, 1)
-        language = QComboBox(); language.addItems(["English", "বাংলা"])
-        refresh = QSpinBox(); refresh.setRange(1, 30); refresh.setValue(3); refresh.setSuffix(" seconds")
-        theme = QComboBox(); theme.addItems(["Emerald", "Cyan", "Amber", "Violet"])
-        for row, (label, control) in enumerate([("Language", language), ("Refresh rate", refresh), ("Theme color", theme)], start=3):
-            grid.addWidget(QLabel(label), row, 0); grid.addWidget(control, row, 1)
-        buttons = QHBoxLayout()
-        save = QPushButton("Save preferences"); save.setObjectName("primary")
-        reset = QPushButton("Reset")
-        save.clicked.connect(lambda: QMessageBox.information(self, "UI demonstration", "Preferences previewed. Nothing was saved to a database."))
-        buttons.addWidget(save); buttons.addWidget(reset); buttons.addStretch()
-        grid.addLayout(buttons, 6, 0, 1, 2)
-        root.addWidget(panel)
-        root.addStretch()
+    def _add(self, values: list) -> None:
+        self.table.insertRow(0)
+        for column, value in enumerate(values): self.table.setItem(0, column, QTableWidgetItem(str(value)))
+        if self.table.rowCount() > 1000: self.table.removeRow(self.table.rowCount() - 1)
 
 
 class AboutPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
         root = QVBoxLayout(self)
-        root.addWidget(PageHeader("About", "A university prototype focused on thoughtful livestock-monitoring experiences."))
+        root.addWidget(PageHeader("About", "NeuroGoru smart livestock safety and monitoring system."))
         card = QFrame(objectName="card")
         layout = QVBoxLayout(card)
-        logo = QLabel("NG")
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setFixedSize(82, 82)
-        logo.setStyleSheet(f"font-size:25px;font-weight:900;color:#062016;background:{ACCENT};border-radius:22px")
-        layout.addWidget(logo, alignment=Qt.AlignmentFlag.AlignHCenter)
         title = QLabel("NeuroGoru")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size:30px;font-weight:850")
-        layout.addWidget(title)
-        description = QLabel("Smart Virtual Fence & Livestock Monitoring System\n\nFrontend-only demonstration built with Python and PySide6. All cattle, locations, alerts, devices and analytics are simulated.\n\nUniversity: [University Name]\nTeam: [Team member placeholders]\nVersion 1.0.0 • Academic Prototype License")
+        title.setStyleSheet(f"font-size:34px;font-weight:900;color:{ACCENT}")
+        description = QLabel("Smart Virtual Fence & Livestock Monitoring System\n\nNeuroGoru combines an ESP32, GPS receiver, temperature sensor, local Wi-Fi communication, and a desktop dashboard to monitor cattle location and wellbeing. The circular virtual fence provides immediate breach awareness without requiring internet access.\n\nSystem components\n• ESP32 controller and local Wi-Fi TCP server\n• GPS location and altitude telemetry\n• Temperature sensing\n• Configurable circular virtual fence\n• Live alerts and telemetry history\n\nVersion 1.0 • Academic prototype")
         description.setAlignment(Qt.AlignmentFlag.AlignCenter)
         description.setWordWrap(True)
         description.setStyleSheet(f"color:{MUTED};font-size:14px")
-        layout.addWidget(description)
-        root.addWidget(card)
-        root.addStretch()
+        layout.addWidget(title); layout.addWidget(description)
+        root.addWidget(card); root.addStretch()

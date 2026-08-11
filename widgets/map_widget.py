@@ -1,82 +1,205 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
-from PySide6.QtWidgets import QWidget
+import math
 
-from mock_data.generator import Cow
+from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
+from PySide6.QtWidgets import QToolTip, QWidget
+
 from styles.theme import ACCENT, DANGER
 
 
-class MockMap(QWidget):
-    marker_selected = Signal(str)
+class TelemetryMap(QWidget):
+    """Offline local map with a live cattle marker and draggable circular fence."""
+
+    fence_previewed = Signal(float, float, float)
+    fence_dropped = Signal(float, float, float)
 
     def __init__(self) -> None:
         super().__init__()
-        self.setMinimumHeight(430)
-        self.cows: list[Cow] = []
-        self.zoom = 1.0
-        self.pan = QPointF(0, 0)
-        self.drag_start: QPointF | None = None
+        self.setMinimumHeight(280)
+        self.setMouseTracking(True)
+        self.telemetry: dict = {}
+        self.fence: tuple[float, float, float] | None = None
+        self._dragging_fence = False
+        self._editable = False
+        self._fence_center_px = QPointF()
+        self._radius_px = 0.0
+        self._meters_per_pixel = 1.0
+        self._origin: tuple[float, float] | None = None
+        self._cattle_point: QPointF | None = None
 
-    def set_cows(self, cows: list[Cow]) -> None:
-        self.cows = cows
+    def set_telemetry(self, data: dict) -> None:
+        self.telemetry = dict(data)
         self.update()
 
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        self.zoom = max(0.75, min(2.3, self.zoom + (0.12 if event.angleDelta().y() > 0 else -0.12)))
+    def set_fence(self, latitude: float, longitude: float, radius: float) -> None:
+        self.fence = (latitude, longitude, radius)
         self.update()
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        self.drag_start = event.position()
+    def set_editable(self, editable: bool) -> None:
+        self._editable = editable
+        self._dragging_fence = False
+        self.unsetCursor()
+        self.update()
 
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self.drag_start:
-            self.pan += event.position() - self.drag_start
-            self.drag_start = event.position()
-            self.update()
+    def _gps_position(self) -> tuple[float, float] | None:
+        if not self.telemetry.get("gps_valid", False):
+            return None
+        try:
+            return float(self.telemetry["latitude"]), float(self.telemetry["longitude"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        self.drag_start = None
+    def _geo_to_point(self, latitude: float, longitude: float) -> QPointF:
+        if self._origin is None:
+            return QPointF(self.width() / 2, self.height() / 2)
+        origin_lat, origin_lon = self._origin
+        north = (latitude - origin_lat) * 111_320.0
+        east = (longitude - origin_lon) * 111_320.0 * math.cos(math.radians(origin_lat))
+        return QPointF(
+            self.width() / 2 + east / self._meters_per_pixel,
+            self.height() / 2 - north / self._meters_per_pixel,
+        )
+
+    def _point_to_geo(self, point: QPointF) -> tuple[float, float]:
+        assert self._origin is not None
+        origin_lat, origin_lon = self._origin
+        east = (point.x() - self.width() / 2) * self._meters_per_pixel
+        north = (self.height() / 2 - point.y()) * self._meters_per_pixel
+        latitude = origin_lat + north / 111_320.0
+        cos_lat = max(0.01, abs(math.cos(math.radians(origin_lat))))
+        longitude = origin_lon + east / (111_320.0 * cos_lat)
+        return latitude, longitude
+
+    @staticmethod
+    def _distance_meters(start: tuple[float, float], end: tuple[float, float]) -> float:
+        lat1, lon1 = map(math.radians, start)
+        lat2, lon2 = map(math.radians, end)
+        delta_lat = lat2 - lat1
+        delta_lon = lon2 - lon1
+        value = (
+            math.sin(delta_lat / 2) ** 2
+            + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+        )
+        return 6_371_000.0 * 2 * math.atan2(math.sqrt(value), math.sqrt(max(0.0, 1.0 - value)))
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor("#0d1b2b"))
-        painter.save()
-        painter.translate(self.width() / 2 + self.pan.x(), self.height() / 2 + self.pan.y())
-        painter.scale(self.zoom, self.zoom)
-        painter.translate(-self.width() / 2, -self.height() / 2)
         painter.setPen(QPen(QColor("#1a3347"), 1))
-        for x in range(-100, self.width() + 100, 42):
-            painter.drawLine(x, -100, x, self.height() + 100)
-        for y in range(-100, self.height() + 100, 42):
-            painter.drawLine(-100, y, self.width() + 100, y)
-        road_pen = QPen(QColor("#29435a"), 15, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-        painter.setPen(road_pen)
-        painter.drawLine(-40, int(self.height() * .72), self.width() + 50, int(self.height() * .24))
-        painter.drawLine(int(self.width() * .25), -40, int(self.width() * .68), self.height() + 30)
-        fence = QPainterPath()
-        fence.moveTo(self.width() * .22, self.height() * .25)
-        fence.lineTo(self.width() * .72, self.height() * .18)
-        fence.lineTo(self.width() * .80, self.height() * .68)
-        fence.lineTo(self.width() * .34, self.height() * .79)
-        fence.closeSubpath()
-        painter.setBrush(QColor(50, 213, 131, 18))
-        painter.setPen(QPen(QColor(ACCENT), 2, Qt.PenStyle.DashLine))
-        painter.drawPath(fence)
-        for index, cow in enumerate(self.cows):
-            x = self.width() * (.3 + (index % 3) * .19) + ((cow.lon * 10000) % 17)
-            y = self.height() * (.34 + (index // 3) * .25) + ((cow.lat * 10000) % 13)
-            color = QColor(DANGER if cow.fence == "Outside" or cow.health == "Critical" else ACCENT)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(color.red(), color.green(), color.blue(), 45))
-            painter.drawEllipse(QPointF(x, y), 17, 17)
-            painter.setBrush(color)
-            painter.drawEllipse(QPointF(x, y), 7, 7)
-            painter.setPen(QColor("#dce8f5"))
-            painter.drawText(int(x + 12), int(y + 5), cow.name)
-        painter.restore()
-        painter.setPen(QColor("#9bb0c8"))
-        painter.drawText(18, 26, "Mock map • Scroll to zoom • Drag to pan")
+        for x in range(0, self.width(), 42):
+            painter.drawLine(x, 0, x, self.height())
+        for y in range(0, self.height(), 42):
+            painter.drawLine(0, y, self.width(), y)
 
+        cattle = self._gps_position()
+        if not self._dragging_fence:
+            self._origin = cattle or (self.fence[:2] if self.fence else None)
+        if self.fence:
+            # Use a perceptual scale so changing the configured radius visibly
+            # grows/shrinks the circle without making large fences unusable.
+            max_radius_px = max(70.0, min(self.width(), self.height()) * 0.42)
+            self._radius_px = min(max_radius_px, 28.0 + 4.0 * math.sqrt(max(1.0, self.fence[2])))
+            self._meters_per_pixel = max(0.1, self.fence[2] / self._radius_px)
+            self._fence_center_px = self._geo_to_point(self.fence[0], self.fence[1])
+            painter.setBrush(QColor(50, 213, 131, 28))
+            line_style = Qt.PenStyle.DashLine if self._editable else Qt.PenStyle.SolidLine
+            painter.setPen(QPen(QColor(ACCENT), 3, line_style))
+            painter.drawEllipse(self._fence_center_px, self._radius_px, self._radius_px)
+            if self._editable:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(ACCENT))
+                painter.drawEllipse(self._fence_center_px, 7, 7)
+            painter.setPen(QColor(ACCENT))
+            mode = "EDIT MODE - drag to reposition" if self._editable else "LOCKED - click Edit Fence to move"
+            painter.drawText(18, 28, f"Virtual fence: {self.fence[2]:.0f} m  -  {mode}")
+
+        if cattle:
+            point = self._geo_to_point(*cattle)
+            self._cattle_point = point
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(240, 68, 56, 65))
+            painter.drawEllipse(point, 20, 20)
+            painter.setBrush(QColor(DANGER))
+            painter.drawEllipse(point, 9, 9)
+            painter.setPen(QColor("#f2f6fc"))
+            painter.drawText(int(point.x() + 14), int(point.y() + 5), "Current cattle location")
+        else:
+            self._cattle_point = None
+            painter.setPen(QColor("#8fa3bc"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for a valid GPS fix from ESP32")
+
+    def _over_fence(self, point: QPointF) -> bool:
+        if not self.fence:
+            return False
+        dx = point.x() - self._fence_center_px.x()
+        dy = point.y() - self._fence_center_px.y()
+        return dx * dx + dy * dy <= self._radius_px * self._radius_px
+
+    def _near_fence_boundary(self, point: QPointF) -> bool:
+        if not self.fence:
+            return False
+        distance_px = math.hypot(point.x() - self._fence_center_px.x(), point.y() - self._fence_center_px.y())
+        return abs(distance_px - self._radius_px) <= 12.0
+
+    def _show_hover_details(self, event: QMouseEvent) -> None:
+        point = event.position()
+        cattle = self._gps_position()
+        if cattle and self._cattle_point is not None and math.hypot(
+            point.x() - self._cattle_point.x(), point.y() - self._cattle_point.y()
+        ) <= 18.0:
+            QToolTip.showText(
+                event.globalPosition().toPoint(),
+                f"Current GPS location\nLatitude: {cattle[0]:.6f}\nLongitude: {cattle[1]:.6f}",
+                self,
+            )
+            return
+        if self.fence and self._origin and self._near_fence_boundary(point):
+            boundary = self._point_to_geo(point)
+            radius = self._distance_meters((self.fence[0], self.fence[1]), boundary)
+            cattle_distance = self._distance_meters(cattle, boundary) if cattle else None
+            detail = (
+                f"Fence boundary point\nLatitude: {boundary[0]:.6f}\nLongitude: {boundary[1]:.6f}"
+                f"\nRadius from fence center: {radius:.1f} m"
+            )
+            if cattle_distance is not None:
+                detail += f"\nDistance from cattle: {cattle_distance:.1f} m"
+            QToolTip.showText(event.globalPosition().toPoint(), detail, self)
+            return
+        QToolTip.hideText()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._editable and event.button() == Qt.MouseButton.LeftButton and self._origin and self._over_fence(event.position()):
+            self._dragging_fence = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._dragging_fence and self.fence and self._origin:
+            latitude, longitude = self._point_to_geo(event.position())
+            self.fence = (latitude, longitude, self.fence[2])
+            self.fence_previewed.emit(*self.fence)
+            self.update()
+            event.accept()
+            return
+        self._show_hover_details(event)
+        can_drag = self._editable and self._over_fence(event.position())
+        self.setCursor(Qt.CursorShape.OpenHandCursor if can_drag else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging_fence and self.fence:
+            self._dragging_fence = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.fence_dropped.emit(*self.fence)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        QToolTip.hideText()
+        super().leaveEvent(event)

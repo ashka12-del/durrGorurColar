@@ -19,14 +19,15 @@ class StatCard(QFrame):
     def __init__(self, title: str, value: str, icon: str, color: str = ACCENT, subtitle: str = "Live mock data") -> None:
         super().__init__()
         self.setObjectName("card")
-        self.setMinimumHeight(126)
-        shadow(self)
+        self.setMinimumHeight(84)
         root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(2)
         top = QHBoxLayout()
         badge = QLabel(icon)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setFixedSize(38, 38)
-        badge.setStyleSheet(f"background:{color}22;color:{color};border-radius:11px;font-size:19px")
+        badge.setFixedSize(28, 28)
+        badge.setStyleSheet(f"background:{color}22;color:{color};border-radius:8px;font-size:11px;font-weight:800")
         top.addWidget(badge)
         top.addStretch()
         pulse = QLabel("● LIVE")
@@ -34,14 +35,14 @@ class StatCard(QFrame):
         top.addWidget(pulse)
         root.addLayout(top)
         self.value_label = QLabel(value)
-        self.value_label.setStyleSheet("font-size:25px;font-weight:800")
+        self.value_label.setStyleSheet("font-size:19px;font-weight:800")
         root.addWidget(self.value_label)
         label = QLabel(title)
         label.setStyleSheet(f"color:{MUTED};font-weight:600")
         root.addWidget(label)
         detail = QLabel(subtitle)
         detail.setStyleSheet("color:#60758e;font-size:10px")
-        root.addWidget(detail)
+        detail.hide()
 
     def set_value(self, value: str) -> None:
         if self.value_label.text() == value:
@@ -60,7 +61,8 @@ class PageHeader(QWidget):
     def __init__(self, title: str, subtitle: str) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 10)
+        layout.setContentsMargins(0, 0, 0, 4)
+        layout.setSpacing(2)
         title_label = QLabel(title)
         title_label.setObjectName("pageTitle")
         subtitle_label = QLabel(subtitle)
@@ -84,4 +86,3 @@ def health_color(status: str) -> str:
 
 
 STATUS_COLORS = {"Healthy": ACCENT, "Warning": WARNING, "Critical": DANGER, "Online": ACCENT, "Degraded": WARNING, "Offline": DANGER, "Info": INFO}
-
