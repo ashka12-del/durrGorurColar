@@ -1,5 +1,9 @@
 .venv*/
+.runtime/
 __pycache__/
 *.py[cod]
 .DS_Store
 preview*.png
+python-*.exe
+python-*.zip
+*.log

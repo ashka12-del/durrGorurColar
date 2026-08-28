@@ -113,10 +113,20 @@ class DashboardPage(QWidget):
         return field
 
     def _submit_fence(self) -> None:
+        radius = self.radius.value()
+        # Indoor bench test: exactly 10.0 m is a deliberate motor-test command
+        # and does not require a GPS fix. The ESP32 firmware runs GPIO32 for
+        # one second when it receives this radius.
+        if abs(radius - 10.0) < 0.05:
+            latitude = self._current_latitude if self._current_latitude is not None else 0.0
+            longitude = self._current_longitude if self._current_longitude is not None else 0.0
+            self.set_fence_feedback("Sending indoor 10 m vibration-motor test...", True)
+            self.fence_submitted.emit(latitude, longitude, radius)
+            return
         if self._current_latitude is None or self._current_longitude is None:
             self.set_fence_feedback("Cannot create fence: waiting for a valid GPS fix.", False)
             return
-        self.fence_submitted.emit(self._current_latitude, self._current_longitude, self.radius.value())
+        self.fence_submitted.emit(self._current_latitude, self._current_longitude, radius)
 
     def _preview_fence(self, _value: float) -> None:
         if self._current_latitude is not None and self._current_longitude is not None:
@@ -182,6 +192,8 @@ class DashboardPage(QWidget):
         self.cards["acceleration_x"].set_value(number("acceleration_x", " g", 3))
         self.cards["acceleration_y"].set_value(number("acceleration_y", " g", 3))
         self.cards["acceleration_z"].set_value(number("acceleration_z", " g", 3))
+        self._gps_online = bool(data.get("gps_detected", self._gps_online))
+        self.set_device_status("gps", self._gps_online)
         status = str(data.get("fence_status", "Unknown")).title()
         self.cards["fence"].set_value(status)
         self.updated_label.setText(f"Last packet: {data.get('received_at', 'just now')}")

@@ -22,6 +22,12 @@ class Esp32Client(QObject):
     def set_fence(self, latitude: float, longitude: float, radius: float) -> bool:
         return self.send_line(f"SET_FENCE:{latitude:.6f},{longitude:.6f},{radius:.1f}")
 
+    def set_demo_cow_position(self, latitude: float, longitude: float) -> bool:
+        return self.send_line(f"DEMO_COW:{latitude:.6f},{longitude:.6f}")
+
+    def clear_demo_cow_position(self) -> bool:
+        return self.send_line("DEMO_COW:OFF")
+
     def __init__(self, host: str, port: int, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.host = host

@@ -14,6 +14,8 @@ class TelemetryMap(QWidget):
 
     fence_previewed = Signal(float, float, float)
     fence_dropped = Signal(float, float, float)
+    cow_previewed = Signal(float, float)
+    cow_dropped = Signal(float, float)
 
     def __init__(self) -> None:
         super().__init__()
@@ -28,9 +30,33 @@ class TelemetryMap(QWidget):
         self._meters_per_pixel = 1.0
         self._origin: tuple[float, float] | None = None
         self._cattle_point: QPointF | None = None
+        self._demo_cow_position: tuple[float, float] | None = None
+        self._cow_editable = False
+        self._dragging_cow = False
 
     def set_telemetry(self, data: dict) -> None:
         self.telemetry = dict(data)
+        if data.get("demo_position_active", False):
+            try:
+                self._demo_cow_position = (float(data["latitude"]), float(data["longitude"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        self.update()
+
+    def set_cow_editable(self, editable: bool) -> bool:
+        if editable and self._gps_position() is None:
+            return False
+        if editable and self._demo_cow_position is None:
+            self._demo_cow_position = self._gps_position()
+        self._cow_editable = editable
+        self._dragging_cow = False
+        self.update()
+        return True
+
+    def clear_demo_cow(self) -> None:
+        self._demo_cow_position = None
+        self._cow_editable = False
+        self._dragging_cow = False
         self.update()
 
     def set_fence(self, latitude: float, longitude: float, radius: float) -> None:
@@ -44,7 +70,13 @@ class TelemetryMap(QWidget):
         self.update()
 
     def _gps_position(self) -> tuple[float, float] | None:
-        if not self.telemetry.get("gps_valid", False):
+        if self._demo_cow_position is not None:
+            return self._demo_cow_position
+        if not (
+            self.telemetry.get("gps_valid", False)
+            or self.telemetry.get("position_cached", False)
+            or self.telemetry.get("position_valid", False)
+        ):
             return None
         try:
             return float(self.telemetry["latitude"]), float(self.telemetry["longitude"])
@@ -95,7 +127,7 @@ class TelemetryMap(QWidget):
             painter.drawLine(0, y, self.width(), y)
 
         cattle = self._gps_position()
-        if not self._dragging_fence:
+        if not self._dragging_fence and not self._dragging_cow:
             self._origin = cattle or (self.fence[:2] if self.fence else None)
         if self.fence:
             # Use a perceptual scale so changing the configured radius visibly
@@ -126,6 +158,13 @@ class TelemetryMap(QWidget):
             painter.drawEllipse(point, 9, 9)
             painter.setPen(QColor("#f2f6fc"))
             painter.drawText(int(point.x() + 14), int(point.y() + 5), "Current cattle location")
+            painter.setPen(QColor("#8fd3ff"))
+            source = "DEMO" if self._demo_cow_position is not None else ("LAST GPS" if self.telemetry.get("position_cached") else "GPS")
+            painter.drawText(
+                int(point.x() - 78),
+                int(point.y() - 25),
+                f"{source}: {cattle[0]:.6f}, {cattle[1]:.6f}",
+            )
         else:
             self._cattle_point = None
             painter.setPen(QColor("#8fa3bc"))
@@ -171,6 +210,20 @@ class TelemetryMap(QWidget):
         QToolTip.hideText()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._cow_editable
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._origin
+            and self._cattle_point is not None
+            and math.hypot(
+                event.position().x() - self._cattle_point.x(),
+                event.position().y() - self._cattle_point.y(),
+            ) <= 24.0
+        ):
+            self._dragging_cow = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         if self._editable and event.button() == Qt.MouseButton.LeftButton and self._origin and self._over_fence(event.position()):
             self._dragging_fence = True
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -179,6 +232,13 @@ class TelemetryMap(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._dragging_cow and self._origin:
+            latitude, longitude = self._point_to_geo(event.position())
+            self._demo_cow_position = (latitude, longitude)
+            self.cow_previewed.emit(latitude, longitude)
+            self.update()
+            event.accept()
+            return
         if self._dragging_fence and self.fence and self._origin:
             latitude, longitude = self._point_to_geo(event.position())
             self.fence = (latitude, longitude, self.fence[2])
@@ -187,11 +247,23 @@ class TelemetryMap(QWidget):
             event.accept()
             return
         self._show_hover_details(event)
-        can_drag = self._editable and self._over_fence(event.position())
+        over_cow = self._cattle_point is not None and math.hypot(
+            event.position().x() - self._cattle_point.x(),
+            event.position().y() - self._cattle_point.y(),
+        ) <= 24.0
+        can_drag = (self._cow_editable and over_cow) or (self._editable and self._over_fence(event.position()))
         self.setCursor(Qt.CursorShape.OpenHandCursor if can_drag else Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging_cow and self._demo_cow_position:
+            self._dragging_cow = False
+            self._cow_editable = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.cow_dropped.emit(*self._demo_cow_position)
+            self.update()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._dragging_fence and self.fence:
             self._dragging_fence = False
             self.setCursor(Qt.CursorShape.OpenHandCursor)

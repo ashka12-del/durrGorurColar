@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QPainter, QPixmap
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget
 
 from esp32_client import Esp32Client
 from pages.dashboard import DashboardPage
@@ -72,6 +72,8 @@ class NeuroGoruWindow(QMainWindow):
         self.last_fence = (23.8376, 90.3576, 250.0)
         self.last_fence_state = None
         self.temperature_abnormal = False
+        self.last_gps_satellite_count: int | None = None
+        self.last_valid_gps_data: dict | None = None
         self._build_ui()
         host = os.environ.get("NEUROGORU_ESP32_HOST", "192.168.4.1")
         try: port = int(os.environ.get("NEUROGORU_ESP32_PORT", "5010"))
@@ -102,6 +104,8 @@ class NeuroGoruWindow(QMainWindow):
         self.dashboard.fence_previewed.connect(self._preview_dashboard_fence)
         self.gps.fence_submitted.connect(self._set_fence)
         self.gps.fence_previewed.connect(self._preview_fence)
+        self.gps.demo_cow_submitted.connect(self._set_demo_cow_position)
+        self.gps.demo_reset_requested.connect(self._clear_demo_cow_position)
         self.gps.set_fence(*self.last_fence)
         timer=QTimer(self); timer.timeout.connect(lambda:self.clock.setText(datetime.now().strftime("%d %b %Y  •  %I:%M:%S %p"))); timer.start(1000); timer.timeout.emit(); self._clock_timer=timer
 
@@ -134,12 +138,53 @@ class NeuroGoruWindow(QMainWindow):
     def _preview_dashboard_fence(self,lat:float,lon:float,radius:float)->None:
         self.gps.set_fence(lat,lon,radius)
 
+    def _set_demo_cow_position(self, lat: float, lon: float) -> None:
+        sent = self.esp32.set_demo_cow_position(lat, lon)
+        self.status_log.add(
+            f"Demo cow position: {lat:.6f}, {lon:.6f}",
+            "Success" if sent else "Warning",
+            "Geofence Demo",
+        )
+
+    def _clear_demo_cow_position(self) -> None:
+        sent = self.esp32.clear_demo_cow_position()
+        self.status_log.add(
+            "Demo cow movement disabled; using real/last-known GPS position",
+            "Success" if sent else "Warning",
+            "Geofence Demo",
+        )
+
     def _message(self,message:str)->None:
         if message.startswith("TELEMETRY:"):
             try: data=json.loads(message.split(":",1)[1])
             except (json.JSONDecodeError,ValueError): self._add_alert("System","Invalid telemetry packet received","Warning"); return
-            aliases={"lat":"latitude","lon":"longitude","lng":"longitude","alt":"altitude","temp":"temperature","distance":"fence_distance","fenceDistance":"fence_distance","fenceStatus":"fence_status","accel_x":"acceleration_x","accel_y":"acceleration_y","accel_z":"acceleration_z","ax":"acceleration_x","ay":"acceleration_y","az":"acceleration_z"}
+            aliases={"lat":"latitude","lon":"longitude","lng":"longitude","alt":"altitude","temp":"temperature","distance":"fence_distance","fenceDistance":"fence_distance","fenceStatus":"fence_status","accel_x":"acceleration_x","accel_y":"acceleration_y","accel_z":"acceleration_z","ax":"acceleration_x","ay":"acceleration_y","az":"acceleration_z","satellites":"gps_satellites","sats":"gps_satellites"}
             data={aliases.get(k,k):v for k,v in data.items()}; data["received_at"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if data.get("gps_valid", False):
+                try:
+                    if float(data["latitude"]) != 0.0 or float(data["longitude"]) != 0.0:
+                        self.last_valid_gps_data = {
+                            "latitude": float(data["latitude"]),
+                            "longitude": float(data["longitude"]),
+                            "altitude": float(data.get("altitude", 0.0)),
+                        }
+                except (KeyError, TypeError, ValueError):
+                    pass
+            elif not data.get("demo_position_active", False) and self.last_valid_gps_data:
+                data.update(self.last_valid_gps_data)
+                data["position_cached"] = True
+            try:
+                satellite_count = max(0, int(data.get("gps_satellites", 0)))
+            except (TypeError, ValueError):
+                satellite_count = 0
+            previous_satellites = self.last_gps_satellite_count
+            if satellite_count > 0 and satellite_count != previous_satellites:
+                self.status_log.add(
+                    f"GPS satellites detected: {satellite_count}", "Success", "GPS"
+                )
+            elif satellite_count == 0 and previous_satellites is not None and previous_satellites > 0:
+                self.status_log.add("GPS satellite signal lost: 0 detected", "Warning", "GPS")
+            self.last_gps_satellite_count = satellite_count
             self.dashboard.update_telemetry(data); self.gps.update_telemetry(data); self.history.add_telemetry(data)
             state=str(data.get("fence_status","")).lower()
             if state=="outside" and self.last_fence_state!="outside": self._add_alert("Fence breach","Cattle moved outside the virtual fence","Critical")
@@ -154,6 +199,14 @@ class NeuroGoruWindow(QMainWindow):
             except (KeyError, TypeError, ValueError):
                 pass
             self.last_fence_state=state
+        elif message.startswith("ALERT:FALL_DEMO:"):
+            alert_message = message.split(":", 2)[2]
+            self._add_alert("Fall Detection", alert_message, "Critical")
+            QMessageBox.critical(
+                self,
+                "EMERGENCY FALL ALERT",
+                f"{alert_message}\n\nDemo mode: triggered by a strong MPU6050 shake.",
+            )
         elif message.startswith("ALERT:"): self._add_alert("ESP32",message.split(":",1)[1],"Critical")
         elif message == "STATUS:DS18B20:ONLINE":
             self.dashboard.set_device_status("ds18b20", True)
@@ -172,6 +225,7 @@ class NeuroGoruWindow(QMainWindow):
             self.status_log.add("NEO-6M GPS sensor connected", "Success", "GPS")
         elif message == "ERROR:GPS:DISCONNECTED":
             self.dashboard.set_device_status("gps", False)
+            self.last_gps_satellite_count = None
             self._add_alert("GPS", "GPS sensor disconnected or not sending data", "Warning")
         elif message.startswith("ACK:FENCE"):
             self.dashboard.set_fence_feedback("ESP32 confirmed the fence update.",True)
