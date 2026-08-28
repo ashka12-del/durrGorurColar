@@ -65,7 +65,7 @@ class MapPage(QWidget):
         self.map.set_telemetry(data)
         if data.get("latitude") is not None and data.get("longitude") is not None:
             source = "DEMO POSITION" if data.get("demo_position_active") else ("LAST KNOWN GPS" if data.get("position_cached") else "LIVE GPS")
-            self.summary.setText(f"{source}: {float(data['latitude']):.6f}, {float(data['longitude']):.6f}  •  {data.get('fence_status', 'Unknown')}")
+            self.summary.setText(f"{source}: {float(data['latitude']):.8f}, {float(data['longitude']):.8f}  •  {data.get('fence_status', 'Unknown')}")
 
     def _begin_cow_demo(self) -> None:
         if not self.map.set_cow_editable(True):
@@ -76,7 +76,7 @@ class MapPage(QWidget):
         self.hint.setText("DEMO MODE - drag the red cow marker and release it near or outside the green fence")
 
     def _cow_previewed(self, latitude: float, longitude: float) -> None:
-        self.summary.setText(f"DEMO POSITION: {latitude:.6f}, {longitude:.6f} - release to apply")
+        self.summary.setText(f"DEMO POSITION: {latitude:.8f}, {longitude:.8f} - release to apply")
 
     def _cow_dropped(self, latitude: float, longitude: float) -> None:
         self.demo_cow_submitted.emit(latitude, longitude)
@@ -165,7 +165,11 @@ class HistoryPage(QWidget):
 
     def add_telemetry(self, data: dict) -> None:
         motion = f"Accel X/Y/Z: {data.get('acceleration_x', '—')}, {data.get('acceleration_y', '—')}, {data.get('acceleration_z', '—')} g"
-        self._add([data.get("received_at", ""), "Telemetry", data.get("latitude", "—"), data.get("longitude", "—"), data.get("altitude", "—"), data.get("temperature", "—"), f"Fence: {data.get('fence_status', 'Unknown')} • {motion}"])
+        lat_str = f"{float(data['latitude']):.8f}" if data.get("latitude") is not None else "—"
+        lon_str = f"{float(data['longitude']):.8f}" if data.get("longitude") is not None else "—"
+        alt_str = f"{float(data['altitude']):.1f} m" if data.get("altitude") is not None else "—"
+        temp_str = f"{float(data['temperature']):.1f} °C" if data.get("temperature") is not None else "—"
+        self._add([data.get("received_at", ""), "Telemetry", lat_str, lon_str, alt_str, temp_str, f"Fence: {data.get('fence_status', 'Unknown')} • {motion}"])
 
     def add_alert(self, alert: dict) -> None:
         self._add([alert.get("time", ""), "Alert", "—", "—", "—", "—", alert.get("message", "")])

@@ -151,20 +151,45 @@ class TelemetryMap(QWidget):
         if cattle:
             point = self._geo_to_point(*cattle)
             self._cattle_point = point
+
+            # Draw red origin point for cow location (glow rings + solid red origin + white pinpoint center)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(240, 68, 56, 65))
-            painter.drawEllipse(point, 20, 20)
+            painter.setBrush(QColor(240, 68, 56, 45))
+            painter.drawEllipse(point, 24, 24)
+            painter.setBrush(QColor(240, 68, 56, 110))
+            painter.drawEllipse(point, 15, 15)
             painter.setBrush(QColor(DANGER))
-            painter.drawEllipse(point, 9, 9)
-            painter.setPen(QColor("#f2f6fc"))
-            painter.drawText(int(point.x() + 14), int(point.y() + 5), "Current cattle location")
+            painter.drawEllipse(point, 8, 8)
+            painter.setBrush(QColor("#ffffff"))
+            painter.drawEllipse(point, 2.5, 2.5)
+
+            # Draw cow location badge directly above the red origin point
+            source = "DEMO" if self._demo_cow_position is not None else ("LAST GPS" if self.telemetry.get("position_cached") else "LIVE GPS")
+            title_text = f"📍 COW ORIGIN [{source}]"
+            coord_text = f"Lat: {cattle[0]:.8f}, Lon: {cattle[1]:.8f}"
+
+            font = painter.font()
+            font.setPointSize(9)
+            font.setBold(True)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            w1 = fm.horizontalAdvance(title_text)
+            w2 = fm.horizontalAdvance(coord_text)
+            box_w = max(w1, w2) + 16
+            box_h = 36
+            box_x = int(point.x() - box_w / 2)
+            box_y = int(point.y() - 22 - box_h)
+
+            painter.setPen(QPen(QColor(DANGER), 1))
+            painter.setBrush(QColor(13, 27, 43, 225))
+            painter.drawRoundedRect(box_x, box_y, box_w, box_h, 6, 6)
+
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(box_x + (box_w - w1) // 2, box_y + 15, title_text)
+            font.setBold(False)
+            painter.setFont(font)
             painter.setPen(QColor("#8fd3ff"))
-            source = "DEMO" if self._demo_cow_position is not None else ("LAST GPS" if self.telemetry.get("position_cached") else "GPS")
-            painter.drawText(
-                int(point.x() - 78),
-                int(point.y() - 25),
-                f"{source}: {cattle[0]:.6f}, {cattle[1]:.6f}",
-            )
+            painter.drawText(box_x + (box_w - w2) // 2, box_y + 30, coord_text)
         else:
             self._cattle_point = None
             painter.setPen(QColor("#8fa3bc"))
@@ -191,7 +216,7 @@ class TelemetryMap(QWidget):
         ) <= 18.0:
             QToolTip.showText(
                 event.globalPosition().toPoint(),
-                f"Current GPS location\nLatitude: {cattle[0]:.6f}\nLongitude: {cattle[1]:.6f}",
+                f"Cattle GPS Origin Location\nLatitude: {cattle[0]:.8f}\nLongitude: {cattle[1]:.8f}",
                 self,
             )
             return
@@ -200,7 +225,7 @@ class TelemetryMap(QWidget):
             radius = self._distance_meters((self.fence[0], self.fence[1]), boundary)
             cattle_distance = self._distance_meters(cattle, boundary) if cattle else None
             detail = (
-                f"Fence boundary point\nLatitude: {boundary[0]:.6f}\nLongitude: {boundary[1]:.6f}"
+                f"Fence boundary point\nLatitude: {boundary[0]:.8f}\nLongitude: {boundary[1]:.8f}"
                 f"\nRadius from fence center: {radius:.1f} m"
             )
             if cattle_distance is not None:

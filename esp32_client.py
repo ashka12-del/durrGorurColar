@@ -20,10 +20,10 @@ class Esp32Client(QObject):
         return True
 
     def set_fence(self, latitude: float, longitude: float, radius: float) -> bool:
-        return self.send_line(f"SET_FENCE:{latitude:.6f},{longitude:.6f},{radius:.1f}")
+        return self.send_line(f"SET_FENCE:{latitude:.8f},{longitude:.8f},{radius:.1f}")
 
     def set_demo_cow_position(self, latitude: float, longitude: float) -> bool:
-        return self.send_line(f"DEMO_COW:{latitude:.6f},{longitude:.6f}")
+        return self.send_line(f"DEMO_COW:{latitude:.8f},{longitude:.8f}")
 
     def clear_demo_cow_position(self) -> bool:
         return self.send_line("DEMO_COW:OFF")

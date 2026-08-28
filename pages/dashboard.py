@@ -102,12 +102,12 @@ class DashboardPage(QWidget):
         root.addLayout(columns)
 
     @staticmethod
-    def _coordinate_input(minimum: float, maximum: float, value: float, decimals: int = 6) -> QDoubleSpinBox:
+    def _coordinate_input(minimum: float, maximum: float, value: float, decimals: int = 8) -> QDoubleSpinBox:
         field = QDoubleSpinBox()
         field.setRange(minimum, maximum)
         field.setDecimals(decimals)
         field.setValue(value)
-        field.setSingleStep(0.0001 if decimals > 1 else 1)
+        field.setSingleStep(0.000001 if decimals > 1 else 1)
         field.setAccelerated(True)
         field.setKeyboardTracking(True)
         return field
@@ -184,8 +184,8 @@ class DashboardPage(QWidget):
         def number(key: str, suffix: str, precision: int) -> str:
             value = data.get(key)
             return "—" if value is None else f"{float(value):.{precision}f}{suffix}"
-        self.cards["latitude"].set_value(number("latitude", "", 6))
-        self.cards["longitude"].set_value(number("longitude", "", 6))
+        self.cards["latitude"].set_value(number("latitude", "", 8))
+        self.cards["longitude"].set_value(number("longitude", "", 8))
         self.cards["altitude"].set_value(number("altitude", " m", 1))
         self.cards["temperature"].set_value(number("temperature", "°C", 1))
         self.cards["distance"].set_value(number("fence_distance", " m", 1))

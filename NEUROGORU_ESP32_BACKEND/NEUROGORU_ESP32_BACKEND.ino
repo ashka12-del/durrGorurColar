@@ -296,8 +296,8 @@ void sendTelemetry() {
   updateBuzzerOutput();
 
   String json = "TELEMETRY:{";
-  json += "\"latitude\":" + String(positionValid ? latitude : 0.0, 6);
-  json += ",\"longitude\":" + String(positionValid ? longitude : 0.0, 6);
+  json += "\"latitude\":" + String(positionValid ? latitude : 0.0, 8);
+  json += ",\"longitude\":" + String(positionValid ? longitude : 0.0, 8);
   json += ",\"altitude\":" + String(altitude, 1);
   json += ",\"temperature\":" + String(temperatureValid ? temperature : 0.0, 2);
   json += ",\"acceleration_x\":" + String(mpuValid ? ax : 0.0, 3);

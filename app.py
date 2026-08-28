@@ -130,7 +130,7 @@ class NeuroGoruWindow(QMainWindow):
         self.dashboard.set_fence_inputs(lat,lon,radius)
         sent=self.esp32.set_fence(lat,lon,radius)
         self.dashboard.set_fence_feedback("Fence sent to ESP32." if sent else "Fence saved locally; ESP32 is offline.", sent)
-        self.status_log.add(f"Fence: {lat:.6f}, {lon:.6f}, radius {radius:.0f} m", "Success" if sent else "Warning", "Fence")
+        self.status_log.add(f"Fence: {lat:.8f}, {lon:.8f}, radius {radius:.0f} m", "Success" if sent else "Warning", "Fence")
 
     def _preview_fence(self,lat:float,lon:float,radius:float)->None:
         self.dashboard.set_fence_inputs(lat,lon,radius)
@@ -141,7 +141,7 @@ class NeuroGoruWindow(QMainWindow):
     def _set_demo_cow_position(self, lat: float, lon: float) -> None:
         sent = self.esp32.set_demo_cow_position(lat, lon)
         self.status_log.add(
-            f"Demo cow position: {lat:.6f}, {lon:.6f}",
+            f"Demo cow position: {lat:.8f}, {lon:.8f}",
             "Success" if sent else "Warning",
             "Geofence Demo",
         )
