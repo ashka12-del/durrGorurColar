@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +75,8 @@ class NeuroGoruWindow(QMainWindow):
         self.temperature_abnormal = False
         self.last_gps_satellite_count: int | None = None
         self.last_valid_gps_data: dict | None = None
+        self.selected_goru = 0
+        self.current_navigation = 0
         self._build_ui()
         host = os.environ.get("NEUROGORU_ESP32_HOST", "192.168.4.1")
         try: port = int(os.environ.get("NEUROGORU_ESP32_PORT", "5010"))
@@ -91,6 +94,20 @@ class NeuroGoruWindow(QMainWindow):
         outer.addWidget(top)
         body = QHBoxLayout(); body.setContentsMargins(0,0,0,0); body.setSpacing(0)
         side = QFrame(objectName="sidebar"); side.setFixedWidth(210); side_l = QVBoxLayout(side); self.nav_buttons=[]
+        cattle_title = QLabel("SELECT CATTLE")
+        cattle_title.setStyleSheet("color:#8fa3bc;font-size:10px;font-weight:900;padding:6px 8px")
+        side_l.addWidget(cattle_title)
+        self.goru_buttons = []
+        for i, label in enumerate(("Goru 1  •  Collar", "Goru 2  •  No collar")):
+            button = QPushButton(label, objectName="nav")
+            button.setCheckable(True)
+            button.clicked.connect(lambda _=False, n=i: self._select_goru(n))
+            side_l.addWidget(button)
+            self.goru_buttons.append(button)
+        self.goru_buttons[0].setChecked(True)
+        section = QLabel("MONITORING")
+        section.setStyleSheet("color:#8fa3bc;font-size:10px;font-weight:900;padding:12px 8px 4px")
+        side_l.addWidget(section)
         for i,(name,icon) in enumerate(self.NAVIGATION):
             button=QPushButton(f"{icon}    {name}", objectName="nav"); button.setCheckable(True); button.clicked.connect(lambda _=False,n=i:self._navigate(n)); side_l.addWidget(button); self.nav_buttons.append(button)
         self.nav_buttons[0].setChecked(True); side_l.addStretch(); body.addWidget(side)
@@ -98,6 +115,19 @@ class NeuroGoruWindow(QMainWindow):
         for page in [self.dashboard,self.gps,self.alerts,self.history,self.about]:
             page.setContentsMargins(12, 8, 12, 8)
             self.stack.addWidget(page)
+        self.no_collar_page = QWidget()
+        no_collar_layout = QVBoxLayout(self.no_collar_page)
+        no_collar_layout.addStretch()
+        no_collar_title = QLabel("Goru 2")
+        no_collar_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        no_collar_title.setStyleSheet("font-size:30px;font-weight:900;color:#ffffff")
+        no_collar_message = QLabel("No collar assigned\nTelemetry will appear here after a collar is connected.")
+        no_collar_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        no_collar_message.setStyleSheet("font-size:16px;color:#8fa3bc")
+        no_collar_layout.addWidget(no_collar_title)
+        no_collar_layout.addWidget(no_collar_message)
+        no_collar_layout.addStretch()
+        self.stack.addWidget(self.no_collar_page)
         body.addWidget(self.stack,1); outer.addLayout(body,1)
         self.status_log = StatusLog(); outer.addWidget(self.status_log)
         self.dashboard.fence_submitted.connect(self._set_fence)
@@ -110,8 +140,27 @@ class NeuroGoruWindow(QMainWindow):
         timer=QTimer(self); timer.timeout.connect(lambda:self.clock.setText(datetime.now().strftime("%d %b %Y  •  %I:%M:%S %p"))); timer.start(1000); timer.timeout.emit(); self._clock_timer=timer
 
     def _navigate(self,index:int)->None:
-        self.stack.setCurrentIndex(index)
+        self.current_navigation = index
+        self.stack.setCurrentIndex(index if self.selected_goru == 0 else 5)
         for i,b in enumerate(self.nav_buttons): b.setChecked(i==index)
+
+    def _select_goru(self, index: int) -> None:
+        self.selected_goru = index
+        for i, button in enumerate(self.goru_buttons):
+            button.setChecked(i == index)
+        self.stack.setCurrentIndex(self.current_navigation if index == 0 else 5)
+        if index == 0:
+            self.status_log.add("Goru 1 selected — collar telemetry active", "Success", "Cattle")
+        else:
+            self.status_log.add("Goru 2 selected — no collar or telemetry assigned", "Info", "Cattle")
+
+    @staticmethod
+    def _distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lon2 - lon1)
+        value = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+        return 6_371_000.0 * 2.0 * math.atan2(math.sqrt(value), math.sqrt(max(0.0, 1.0 - value)))
 
     def _status_changed(self,online:bool,detail:str)->None:
         self.dashboard.set_device_status("esp32", online)
@@ -160,6 +209,8 @@ class NeuroGoruWindow(QMainWindow):
             except (json.JSONDecodeError,ValueError): self._add_alert("System","Invalid telemetry packet received","Warning"); return
             aliases={"lat":"latitude","lon":"longitude","lng":"longitude","alt":"altitude","temp":"temperature","distance":"fence_distance","fenceDistance":"fence_distance","fenceStatus":"fence_status","accel_x":"acceleration_x","accel_y":"acceleration_y","accel_z":"acceleration_z","ax":"acceleration_x","ay":"acceleration_y","az":"acceleration_z","satellites":"gps_satellites","sats":"gps_satellites"}
             data={aliases.get(k,k):v for k,v in data.items()}; data["received_at"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if data.get("gps_fix_stored", False) and not data.get("gps_valid", False):
+                data["position_cached"] = True
             if data.get("gps_valid", False):
                 try:
                     if float(data["latitude"]) != 0.0 or float(data["longitude"]) != 0.0:
@@ -173,6 +224,22 @@ class NeuroGoruWindow(QMainWindow):
             elif not data.get("demo_position_active", False) and self.last_valid_gps_data:
                 data.update(self.last_valid_gps_data)
                 data["position_cached"] = True
+            # Calculate geofence distance from the position actually shown by
+            # the UI, so live and retained GPS positions behave consistently.
+            try:
+                latitude = float(data["latitude"])
+                longitude = float(data["longitude"])
+                has_displayed_position = latitude != 0.0 or longitude != 0.0
+                if has_displayed_position:
+                    fence_latitude, fence_longitude, fence_radius = self.last_fence
+                    center_distance = self._distance_meters(
+                        latitude, longitude, fence_latitude, fence_longitude
+                    )
+                    boundary_distance = float(fence_radius) - center_distance
+                    data["fence_distance"] = round(boundary_distance, 1)
+                    data["fence_status"] = "inside" if boundary_distance >= 0.0 else "outside"
+            except (KeyError, TypeError, ValueError):
+                pass
             try:
                 satellite_count = max(0, int(data.get("gps_satellites", 0)))
             except (TypeError, ValueError):

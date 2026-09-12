@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 
 from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
@@ -24,6 +25,10 @@ class TelemetryMap(QWidget):
         self.telemetry: dict = {}
         self.fence: tuple[float, float, float] | None = None
         self._dragging_fence = False
+        self._drag_meters_per_pixel = 1.0
+        self._moving_fence = False
+        self._move_start_point = QPointF()
+        self._move_start_fence: tuple[float, float, float] | None = None
         self._editable = False
         self._fence_center_px = QPointF()
         self._radius_px = 0.0
@@ -31,11 +36,22 @@ class TelemetryMap(QWidget):
         self._origin: tuple[float, float] | None = None
         self._cattle_point: QPointF | None = None
         self._demo_cow_position: tuple[float, float] | None = None
+        self._cow_origin: tuple[float, float] | None = None
         self._cow_editable = False
         self._dragging_cow = False
+        self._trail: deque[tuple[float, float]] = deque(maxlen=80)
 
     def set_telemetry(self, data: dict) -> None:
         self.telemetry = dict(data)
+        if data.get("gps_valid", False) and not data.get("demo_position_active", False):
+            try:
+                position = (float(data["latitude"]), float(data["longitude"]))
+                if (position[0] != 0.0 or position[1] != 0.0) and (
+                    not self._trail or self._distance_meters(self._trail[-1], position) >= 1.0
+                ):
+                    self._trail.append(position)
+            except (KeyError, TypeError, ValueError):
+                pass
         if data.get("demo_position_active", False):
             try:
                 self._demo_cow_position = (float(data["latitude"]), float(data["longitude"]))
@@ -60,12 +76,15 @@ class TelemetryMap(QWidget):
         self.update()
 
     def set_fence(self, latitude: float, longitude: float, radius: float) -> None:
+        if self._cow_origin is None:
+            self._cow_origin = (latitude, longitude)
         self.fence = (latitude, longitude, radius)
         self.update()
 
     def set_editable(self, editable: bool) -> None:
         self._editable = editable
         self._dragging_fence = False
+        self._moving_fence = False
         self.unsetCursor()
         self.update()
 
@@ -77,11 +96,11 @@ class TelemetryMap(QWidget):
             or self.telemetry.get("position_cached", False)
             or self.telemetry.get("position_valid", False)
         ):
-            return None
+            return self._cow_origin
         try:
             return float(self.telemetry["latitude"]), float(self.telemetry["longitude"])
         except (KeyError, TypeError, ValueError):
-            return None
+            return self._cow_origin
 
     def _geo_to_point(self, latitude: float, longitude: float) -> QPointF:
         if self._origin is None:
@@ -126,8 +145,16 @@ class TelemetryMap(QWidget):
         for y in range(0, self.height(), 42):
             painter.drawLine(0, y, self.width(), y)
 
+        # Map furniture keeps the offline view readable without internet tiles.
+        painter.setPen(QPen(QColor("#37516a"), 1))
+        painter.drawLine(self.width() - 42, 54, self.width() - 42, 18)
+        painter.drawLine(self.width() - 47, 25, self.width() - 42, 18)
+        painter.drawLine(self.width() - 37, 25, self.width() - 42, 18)
+        painter.setPen(QColor("#b8cbe0"))
+        painter.drawText(self.width() - 47, 68, "N")
+
         cattle = self._gps_position()
-        if not self._dragging_fence and not self._dragging_cow:
+        if not self._dragging_fence and not self._moving_fence and not self._dragging_cow:
             self._origin = cattle or (self.fence[:2] if self.fence else None)
         if self.fence:
             # Use a perceptual scale so changing the configured radius visibly
@@ -136,21 +163,59 @@ class TelemetryMap(QWidget):
             self._radius_px = min(max_radius_px, 28.0 + 4.0 * math.sqrt(max(1.0, self.fence[2])))
             self._meters_per_pixel = max(0.1, self.fence[2] / self._radius_px)
             self._fence_center_px = self._geo_to_point(self.fence[0], self.fence[1])
-            painter.setBrush(QColor(50, 213, 131, 28))
+            if cattle:
+                cow_inside_fence = self._distance_meters(
+                    cattle, (self.fence[0], self.fence[1])
+                ) <= self.fence[2]
+                fence_state = "inside" if cow_inside_fence else "outside"
+            else:
+                fence_state = "waiting"
+            fence_color = QColor(DANGER) if fence_state == "outside" else QColor(ACCENT)
+            painter.setBrush(QColor(fence_color.red(), fence_color.green(), fence_color.blue(), 32))
             line_style = Qt.PenStyle.DashLine if self._editable else Qt.PenStyle.SolidLine
-            painter.setPen(QPen(QColor(ACCENT), 3, line_style))
+            painter.setPen(QPen(fence_color, 3, line_style))
             painter.drawEllipse(self._fence_center_px, self._radius_px, self._radius_px)
+
             if self._editable:
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor(ACCENT))
-                painter.drawEllipse(self._fence_center_px, 7, 7)
-            painter.setPen(QColor(ACCENT))
-            mode = "EDIT MODE - drag to reposition" if self._editable else "LOCKED - click Edit Fence to move"
-            painter.drawText(18, 28, f"Virtual fence: {self.fence[2]:.0f} m  -  {mode}")
+                handles = (
+                    QPointF(self._fence_center_px.x() - self._radius_px, self._fence_center_px.y()),
+                    QPointF(self._fence_center_px.x() + self._radius_px, self._fence_center_px.y()),
+                    QPointF(self._fence_center_px.x(), self._fence_center_px.y() - self._radius_px),
+                    QPointF(self._fence_center_px.x(), self._fence_center_px.y() + self._radius_px),
+                )
+                for handle in handles:
+                    painter.drawEllipse(handle, 8, 8)
+
+            painter.setPen(fence_color)
+            mode = "EDIT MODE - resize edge or move shaded area" if self._editable else "LOCKED - click Edit Fence"
+            painter.drawText(18, 28, f"Virtual fence: {self.fence[2]:.0f} m  •  {fence_state.upper()}  •  {mode}")
+
+            # A scale bar reflects the current fence-derived map scale.
+            scale_m = max(1, round(self._meters_per_pixel * 80))
+            scale_px = scale_m / self._meters_per_pixel
+            painter.setPen(QPen(QColor("#b8cbe0"), 2))
+            y = self.height() - 22
+            painter.drawLine(18, y, int(18 + scale_px), y)
+            painter.drawLine(18, y - 4, 18, y + 4)
+            painter.drawLine(int(18 + scale_px), y - 4, int(18 + scale_px), y + 4)
+            painter.drawText(18, y - 7, f"{scale_m} m")
+
+        if len(self._trail) > 1 and self._origin:
+            trail_points = [self._geo_to_point(*position) for position in self._trail]
+            painter.setPen(QPen(QColor(51, 190, 255, 150), 2, Qt.PenStyle.DashLine))
+            for start, end in zip(trail_points, trail_points[1:]):
+                painter.drawLine(start, end)
 
         if cattle:
             point = self._geo_to_point(*cattle)
             self._cattle_point = point
+
+            if self.fence:
+                inside = self._distance_meters(cattle, (self.fence[0], self.fence[1])) <= self.fence[2]
+                painter.setPen(QPen(QColor(ACCENT if inside else DANGER), 2, Qt.PenStyle.DashLine))
+                painter.drawLine(point, self._fence_center_px)
 
             # Draw red origin point for cow location (glow rings + solid red origin + white pinpoint center)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -163,33 +228,6 @@ class TelemetryMap(QWidget):
             painter.setBrush(QColor("#ffffff"))
             painter.drawEllipse(point, 2.5, 2.5)
 
-            # Draw cow location badge directly above the red origin point
-            source = "DEMO" if self._demo_cow_position is not None else ("LAST GPS" if self.telemetry.get("position_cached") else "LIVE GPS")
-            title_text = f"📍 COW ORIGIN [{source}]"
-            coord_text = f"Lat: {cattle[0]:.8f}, Lon: {cattle[1]:.8f}"
-
-            font = painter.font()
-            font.setPointSize(9)
-            font.setBold(True)
-            painter.setFont(font)
-            fm = painter.fontMetrics()
-            w1 = fm.horizontalAdvance(title_text)
-            w2 = fm.horizontalAdvance(coord_text)
-            box_w = max(w1, w2) + 16
-            box_h = 36
-            box_x = int(point.x() - box_w / 2)
-            box_y = int(point.y() - 22 - box_h)
-
-            painter.setPen(QPen(QColor(DANGER), 1))
-            painter.setBrush(QColor(13, 27, 43, 225))
-            painter.drawRoundedRect(box_x, box_y, box_w, box_h, 6, 6)
-
-            painter.setPen(QColor("#ffffff"))
-            painter.drawText(box_x + (box_w - w1) // 2, box_y + 15, title_text)
-            font.setBold(False)
-            painter.setFont(font)
-            painter.setPen(QColor("#8fd3ff"))
-            painter.drawText(box_x + (box_w - w2) // 2, box_y + 30, coord_text)
         else:
             self._cattle_point = None
             painter.setPen(QColor("#8fa3bc"))
@@ -216,7 +254,7 @@ class TelemetryMap(QWidget):
         ) <= 18.0:
             QToolTip.showText(
                 event.globalPosition().toPoint(),
-                f"Cattle GPS Origin Location\nLatitude: {cattle[0]:.8f}\nLongitude: {cattle[1]:.8f}",
+                f"Latitude: {cattle[0]:.8f}\nLongitude: {cattle[1]:.8f}",
                 self,
             )
             return
@@ -249,8 +287,17 @@ class TelemetryMap(QWidget):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
-        if self._editable and event.button() == Qt.MouseButton.LeftButton and self._origin and self._over_fence(event.position()):
+        if self._editable and event.button() == Qt.MouseButton.LeftButton and self._origin and self._near_fence_boundary(event.position()):
             self._dragging_fence = True
+            self._drag_meters_per_pixel = self._meters_per_pixel
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        if self._editable and event.button() == Qt.MouseButton.LeftButton and self._origin and self._over_fence(event.position()):
+            self._moving_fence = True
+            self._move_start_point = event.position()
+            self._move_start_fence = self.fence
+            self._drag_meters_per_pixel = self._meters_per_pixel
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
@@ -265,8 +312,24 @@ class TelemetryMap(QWidget):
             event.accept()
             return
         if self._dragging_fence and self.fence and self._origin:
-            latitude, longitude = self._point_to_geo(event.position())
-            self.fence = (latitude, longitude, self.fence[2])
+            distance_px = math.hypot(
+                event.position().x() - self._fence_center_px.x(),
+                event.position().y() - self._fence_center_px.y(),
+            )
+            radius = min(100_000.0, max(1.0, distance_px * self._drag_meters_per_pixel))
+            self.fence = (self.fence[0], self.fence[1], radius)
+            self.fence_previewed.emit(*self.fence)
+            self.update()
+            event.accept()
+            return
+        if self._moving_fence and self._move_start_fence and self._origin:
+            start_latitude, start_longitude, radius = self._move_start_fence
+            east = (event.position().x() - self._move_start_point.x()) * self._drag_meters_per_pixel
+            north = (self._move_start_point.y() - event.position().y()) * self._drag_meters_per_pixel
+            latitude = start_latitude + north / 111_320.0
+            cos_lat = max(0.01, abs(math.cos(math.radians(start_latitude))))
+            longitude = start_longitude + east / (111_320.0 * cos_lat)
+            self.fence = (latitude, longitude, radius)
             self.fence_previewed.emit(*self.fence)
             self.update()
             event.accept()
@@ -276,8 +339,11 @@ class TelemetryMap(QWidget):
             event.position().x() - self._cattle_point.x(),
             event.position().y() - self._cattle_point.y(),
         ) <= 24.0
-        can_drag = (self._cow_editable and over_cow) or (self._editable and self._over_fence(event.position()))
-        self.setCursor(Qt.CursorShape.OpenHandCursor if can_drag else Qt.CursorShape.ArrowCursor)
+        over_boundary = self._editable and self._near_fence_boundary(event.position())
+        over_area = self._editable and self._over_fence(event.position())
+        can_drag = (self._cow_editable and over_cow) or over_boundary or over_area
+        cursor = Qt.CursorShape.SizeAllCursor if over_area and not over_boundary else Qt.CursorShape.OpenHandCursor
+        self.setCursor(cursor if can_drag else Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -292,6 +358,13 @@ class TelemetryMap(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self._dragging_fence and self.fence:
             self._dragging_fence = False
             self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.fence_dropped.emit(*self.fence)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._moving_fence and self.fence:
+            self._moving_fence = False
+            self._move_start_fence = None
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
             self.fence_dropped.emit(*self.fence)
             event.accept()
             return

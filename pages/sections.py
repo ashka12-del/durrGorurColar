@@ -45,7 +45,7 @@ class MapPage(QWidget):
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self._cancel_edit)
         self.cancel_button.setVisible(False)
-        self.update_button = QPushButton("Apply Current Position")
+        self.update_button = QPushButton("Update Fence")
         self.update_button.setObjectName("primary")
         self.update_button.clicked.connect(self._apply_edit)
         self.update_button.setVisible(False)
@@ -103,14 +103,15 @@ class MapPage(QWidget):
         self.cancel_button.setVisible(True)
         self.update_button.setVisible(True)
         self.update_button.setEnabled(False)
-        self.hint.setText("EDIT MODE  •  Drag the green fence, then select Update Fence  •  Hover markers for details")
+        self.hint.setText("EDIT MODE  •  Drag green handles to resize  •  Drag shaded area to move entire fence  •  Update Fence to save")
 
     def _fence_moved(self, latitude: float, longitude: float, radius: float) -> None:
-        # Mouse release applies the deliberately dragged fence immediately.
-        # This supports an indoor demonstration without moving the GPS unit.
+        # Dropping the origin changes only the local preview. The user must
+        # explicitly select Update Fence before it is sent to the ESP32.
         self.update_button.setEnabled(True)
-        self.fence_submitted.emit(latitude, longitude, radius)
-        self._finish_edit()
+        self.summary.setText(
+            f"FENCE PREVIEW: center {latitude:.8f}, {longitude:.8f}  •  radius {radius:.1f} m  •  Update Fence to save"
+        )
 
     def _apply_edit(self) -> None:
         if self.map.fence:

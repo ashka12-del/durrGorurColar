@@ -54,6 +54,8 @@ class DashboardPage(QWidget):
         self._gps_online = False
         self._current_latitude: float | None = None
         self._current_longitude: float | None = None
+        self._fence_latitude: float | None = None
+        self._fence_longitude: float | None = None
         grid = QGridLayout()
         grid.setSpacing(6)
         self.cards = {
@@ -114,25 +116,32 @@ class DashboardPage(QWidget):
 
     def _submit_fence(self) -> None:
         radius = self.radius.value()
-        # Indoor bench test: exactly 10.0 m is a deliberate motor-test command
-        # and does not require a GPS fix. The ESP32 firmware runs GPIO32 for
-        # one second when it receives this radius.
-        if abs(radius - 10.0) < 0.05:
-            latitude = self._current_latitude if self._current_latitude is not None else 0.0
-            longitude = self._current_longitude if self._current_longitude is not None else 0.0
-            self.set_fence_feedback("Sending indoor 10 m vibration-motor test...", True)
-            self.fence_submitted.emit(latitude, longitude, radius)
+        if self._fence_latitude is None or self._fence_longitude is None:
+            if self._current_latitude is None or self._current_longitude is None:
+                self.set_fence_feedback("Cannot create fence until the first valid GPS fix is received.", False)
+                return
+            # The first fence is anchored at the cow's latest valid position.
+            # Later radius changes keep this center fixed.
+            self._fence_latitude = self._current_latitude
+            self._fence_longitude = self._current_longitude
+        if self._fence_latitude is None or self._fence_longitude is None:
+            self.set_fence_feedback("Cannot create fence until the first valid GPS fix is received.", False)
             return
-        if self._current_latitude is None or self._current_longitude is None:
-            self.set_fence_feedback("Cannot create fence: waiting for a valid GPS fix.", False)
-            return
-        self.fence_submitted.emit(self._current_latitude, self._current_longitude, radius)
+        self.set_fence_feedback("Updating fence radius; the origin remains fixed.", True)
+        self.fence_submitted.emit(self._fence_latitude, self._fence_longitude, radius)
 
     def _preview_fence(self, _value: float) -> None:
-        if self._current_latitude is not None and self._current_longitude is not None:
-            self.fence_previewed.emit(self._current_latitude, self._current_longitude, self.radius.value())
+        latitude = self._fence_latitude
+        longitude = self._fence_longitude
+        if latitude is None or longitude is None:
+            latitude = self._current_latitude
+            longitude = self._current_longitude
+        if latitude is not None and longitude is not None:
+            self.fence_previewed.emit(latitude, longitude, self.radius.value())
 
     def set_fence_inputs(self, latitude: float, longitude: float, radius: float) -> None:
+        self._fence_latitude = latitude
+        self._fence_longitude = longitude
         self.radius.blockSignals(True)
         self.radius.setValue(radius)
         self.radius.blockSignals(False)
@@ -197,9 +206,12 @@ class DashboardPage(QWidget):
         status = str(data.get("fence_status", "Unknown")).title()
         self.cards["fence"].set_value(status)
         self.updated_label.setText(f"Last packet: {data.get('received_at', 'just now')}")
-        if data.get("gps_valid", False):
+        if data.get("position_valid", False) and not data.get("demo_position_active", False):
             try:
-                self._current_latitude = float(data["latitude"])
-                self._current_longitude = float(data["longitude"])
+                latitude = float(data["latitude"])
+                longitude = float(data["longitude"])
+                if latitude != 0.0 or longitude != 0.0:
+                    self._current_latitude = latitude
+                    self._current_longitude = longitude
             except (KeyError, TypeError, ValueError):
                 pass
