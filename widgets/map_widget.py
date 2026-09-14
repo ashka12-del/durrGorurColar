@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import deque
 
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QToolTip, QWidget
 
@@ -24,6 +24,7 @@ class TelemetryMap(QWidget):
         self.setMouseTracking(True)
         self.telemetry: dict = {}
         self.fence: tuple[float, float, float] | None = None
+        self.fence_shape = "circle"
         self._dragging_fence = False
         self._drag_meters_per_pixel = 1.0
         self._moving_fence = False
@@ -80,6 +81,25 @@ class TelemetryMap(QWidget):
             self._cow_origin = (latitude, longitude)
         self.fence = (latitude, longitude, radius)
         self.update()
+
+    def set_fence_shape(self, shape: str) -> None:
+        normalized = shape.strip().lower()
+        if normalized in {"circle", "oval", "square", "rectangle"}:
+            self.fence_shape = normalized
+            self.update()
+
+    def _vertical_ratio(self) -> float:
+        return 0.70 if self.fence_shape == "oval" else 0.65 if self.fence_shape == "rectangle" else 1.0
+
+    def _normalized_geo_distance(self, position: tuple[float, float]) -> float:
+        if not self.fence:
+            return 0.0
+        center_lat, center_lon, radius = self.fence
+        north = (position[0] - center_lat) * 111_320.0
+        east = (position[1] - center_lon) * 111_320.0 * math.cos(math.radians(center_lat))
+        x = abs(east) / max(0.1, radius)
+        y = abs(north) / max(0.1, radius * self._vertical_ratio())
+        return max(x, y) if self.fence_shape in {"square", "rectangle"} else math.hypot(x, y)
 
     def set_editable(self, editable: bool) -> None:
         self._editable = editable
@@ -155,18 +175,30 @@ class TelemetryMap(QWidget):
 
         cattle = self._gps_position()
         if not self._dragging_fence and not self._moving_fence and not self._dragging_cow:
-            self._origin = cattle or (self.fence[:2] if self.fence else None)
+            if cattle and self.fence:
+                self._origin = (
+                    (cattle[0] + self.fence[0]) / 2.0,
+                    (cattle[1] + self.fence[1]) / 2.0,
+                )
+            else:
+                self._origin = cattle or (self.fence[:2] if self.fence else None)
         if self.fence:
             # Use a perceptual scale so changing the configured radius visibly
             # grows/shrinks the circle without making large fences unusable.
             max_radius_px = max(70.0, min(self.width(), self.height()) * 0.42)
-            self._radius_px = min(max_radius_px, 28.0 + 4.0 * math.sqrt(max(1.0, self.fence[2])))
-            self._meters_per_pixel = max(0.1, self.fence[2] / self._radius_px)
+            desired_radius_px = min(max_radius_px, 28.0 + 4.0 * math.sqrt(max(1.0, self.fence[2])))
+            self._meters_per_pixel = max(0.1, self.fence[2] / desired_radius_px)
+            if cattle:
+                separation = self._distance_meters(cattle, (self.fence[0], self.fence[1]))
+                available_span_px = max(100.0, min(self.width() * 0.78, self.height() * 0.72))
+                self._meters_per_pixel = max(
+                    self._meters_per_pixel,
+                    (separation + 2.0 * self.fence[2]) / available_span_px,
+                )
+            self._radius_px = max(8.0, self.fence[2] / self._meters_per_pixel)
             self._fence_center_px = self._geo_to_point(self.fence[0], self.fence[1])
             if cattle:
-                cow_inside_fence = self._distance_meters(
-                    cattle, (self.fence[0], self.fence[1])
-                ) <= self.fence[2]
+                cow_inside_fence = self._normalized_geo_distance(cattle) <= 1.0
                 fence_state = "inside" if cow_inside_fence else "outside"
             else:
                 fence_state = "waiting"
@@ -174,7 +206,17 @@ class TelemetryMap(QWidget):
             painter.setBrush(QColor(fence_color.red(), fence_color.green(), fence_color.blue(), 32))
             line_style = Qt.PenStyle.DashLine if self._editable else Qt.PenStyle.SolidLine
             painter.setPen(QPen(fence_color, 3, line_style))
-            painter.drawEllipse(self._fence_center_px, self._radius_px, self._radius_px)
+            vertical_radius = self._radius_px * self._vertical_ratio()
+            boundary_rect = QRectF(
+                self._fence_center_px.x() - self._radius_px,
+                self._fence_center_px.y() - vertical_radius,
+                self._radius_px * 2.0,
+                vertical_radius * 2.0,
+            )
+            if self.fence_shape in {"square", "rectangle"}:
+                painter.drawRect(boundary_rect)
+            else:
+                painter.drawEllipse(boundary_rect)
 
             if self._editable:
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -182,15 +224,15 @@ class TelemetryMap(QWidget):
                 handles = (
                     QPointF(self._fence_center_px.x() - self._radius_px, self._fence_center_px.y()),
                     QPointF(self._fence_center_px.x() + self._radius_px, self._fence_center_px.y()),
-                    QPointF(self._fence_center_px.x(), self._fence_center_px.y() - self._radius_px),
-                    QPointF(self._fence_center_px.x(), self._fence_center_px.y() + self._radius_px),
+                    QPointF(self._fence_center_px.x(), self._fence_center_px.y() - vertical_radius),
+                    QPointF(self._fence_center_px.x(), self._fence_center_px.y() + vertical_radius),
                 )
                 for handle in handles:
                     painter.drawEllipse(handle, 8, 8)
 
             painter.setPen(fence_color)
             mode = "EDIT MODE - resize edge or move shaded area" if self._editable else "LOCKED - click Edit Fence"
-            painter.drawText(18, 28, f"Virtual fence: {self.fence[2]:.0f} m  •  {fence_state.upper()}  •  {mode}")
+            painter.drawText(18, 28, f"{self.fence_shape.title()} fence: {self.fence[2]:.0f} m  •  {fence_state.upper()}  •  {mode}")
 
             # A scale bar reflects the current fence-derived map scale.
             scale_m = max(1, round(self._meters_per_pixel * 80))
@@ -213,7 +255,7 @@ class TelemetryMap(QWidget):
             self._cattle_point = point
 
             if self.fence:
-                inside = self._distance_meters(cattle, (self.fence[0], self.fence[1])) <= self.fence[2]
+                inside = self._normalized_geo_distance(cattle) <= 1.0
                 painter.setPen(QPen(QColor(ACCENT if inside else DANGER), 2, Qt.PenStyle.DashLine))
                 painter.drawLine(point, self._fence_center_px)
 
@@ -238,13 +280,18 @@ class TelemetryMap(QWidget):
             return False
         dx = point.x() - self._fence_center_px.x()
         dy = point.y() - self._fence_center_px.y()
-        return dx * dx + dy * dy <= self._radius_px * self._radius_px
+        x = abs(dx) / max(1.0, self._radius_px)
+        y = abs(dy) / max(1.0, self._radius_px * self._vertical_ratio())
+        normalized = max(x, y) if self.fence_shape in {"square", "rectangle"} else math.hypot(x, y)
+        return normalized <= 1.0
 
     def _near_fence_boundary(self, point: QPointF) -> bool:
         if not self.fence:
             return False
-        distance_px = math.hypot(point.x() - self._fence_center_px.x(), point.y() - self._fence_center_px.y())
-        return abs(distance_px - self._radius_px) <= 12.0
+        dx = abs(point.x() - self._fence_center_px.x()) / max(1.0, self._radius_px)
+        dy = abs(point.y() - self._fence_center_px.y()) / max(1.0, self._radius_px * self._vertical_ratio())
+        normalized = max(dx, dy) if self.fence_shape in {"square", "rectangle"} else math.hypot(dx, dy)
+        return abs(normalized - 1.0) * self._radius_px <= 12.0
 
     def _show_hover_details(self, event: QMouseEvent) -> None:
         point = event.position()
@@ -312,10 +359,9 @@ class TelemetryMap(QWidget):
             event.accept()
             return
         if self._dragging_fence and self.fence and self._origin:
-            distance_px = math.hypot(
-                event.position().x() - self._fence_center_px.x(),
-                event.position().y() - self._fence_center_px.y(),
-            )
+            dx = abs(event.position().x() - self._fence_center_px.x())
+            dy = abs(event.position().y() - self._fence_center_px.y()) / self._vertical_ratio()
+            distance_px = max(dx, dy) if self.fence_shape in {"square", "rectangle"} else math.hypot(dx, dy)
             radius = min(100_000.0, max(1.0, distance_px * self._drag_meters_per_pixel))
             self.fence = (self.fence[0], self.fence[1], radius)
             self.fence_previewed.emit(*self.fence)

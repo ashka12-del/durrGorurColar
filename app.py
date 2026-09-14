@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QPainter, QPixmap
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget
 
 from esp32_client import Esp32Client
 from pages.dashboard import DashboardPage
@@ -71,6 +71,7 @@ class NeuroGoruWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__(); self.setWindowTitle("NeuroGoru • Smart Livestock Monitoring"); self.resize(1360, 860); self.setMinimumSize(1050, 680); self.setStyleSheet(stylesheet())
         self.last_fence = (23.8376, 90.3576, 250.0)
+        self.last_fence_shape = "circle"
         self.last_fence_state = None
         self.temperature_abnormal = False
         self.last_gps_satellite_count: int | None = None
@@ -132,7 +133,7 @@ class NeuroGoruWindow(QMainWindow):
         self.status_log = StatusLog(); outer.addWidget(self.status_log)
         self.dashboard.fence_submitted.connect(self._set_fence)
         self.dashboard.fence_previewed.connect(self._preview_dashboard_fence)
-        self.gps.fence_submitted.connect(self._set_fence)
+        self.gps.fence_submitted.connect(self._set_map_fence)
         self.gps.fence_previewed.connect(self._preview_fence)
         self.gps.demo_cow_submitted.connect(self._set_demo_cow_position)
         self.gps.demo_reset_requested.connect(self._clear_demo_cow_position)
@@ -177,9 +178,13 @@ class NeuroGoruWindow(QMainWindow):
         self.last_fence=(lat,lon,radius)
         self.gps.set_fence(lat,lon,radius)
         self.dashboard.set_fence_inputs(lat,lon,radius)
-        sent=self.esp32.set_fence(lat,lon,radius)
+        sent=self.esp32.set_fence(lat,lon,radius,self.last_fence_shape)
         self.dashboard.set_fence_feedback("Fence sent to ESP32." if sent else "Fence saved locally; ESP32 is offline.", sent)
         self.status_log.add(f"Fence: {lat:.8f}, {lon:.8f}, radius {radius:.0f} m", "Success" if sent else "Warning", "Fence")
+
+    def _set_map_fence(self, lat: float, lon: float, radius: float, shape: str) -> None:
+        self.last_fence_shape = shape.lower()
+        self._set_fence(lat, lon, radius)
 
     def _preview_fence(self,lat:float,lon:float,radius:float)->None:
         self.dashboard.set_fence_inputs(lat,lon,radius)
@@ -209,6 +214,23 @@ class NeuroGoruWindow(QMainWindow):
             except (json.JSONDecodeError,ValueError): self._add_alert("System","Invalid telemetry packet received","Warning"); return
             aliases={"lat":"latitude","lon":"longitude","lng":"longitude","alt":"altitude","temp":"temperature","distance":"fence_distance","fenceDistance":"fence_distance","fenceStatus":"fence_status","accel_x":"acceleration_x","accel_y":"acceleration_y","accel_z":"acceleration_z","ax":"acceleration_x","ay":"acceleration_y","az":"acceleration_z","satellites":"gps_satellites","sats":"gps_satellites"}
             data={aliases.get(k,k):v for k,v in data.items()}; data["received_at"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # The ESP32 is the source of truth for the active fence. This keeps
+            # map edits and manual radius updates synchronized after reconnects.
+            if data.get("fence_set", False):
+                try:
+                    active_fence = (
+                        float(data["fence_latitude"]),
+                        float(data["fence_longitude"]),
+                        float(data["fence_radius"]),
+                    )
+                    self.last_fence = active_fence
+                    self.last_fence_shape = str(data.get("fence_shape", "circle")).lower()
+                    self.dashboard.set_fence_inputs(*active_fence)
+                    if not self.gps.map._editable:
+                        self.gps.set_fence(*active_fence)
+                        self.gps.set_fence_shape(self.last_fence_shape)
+                except (KeyError, TypeError, ValueError):
+                    pass
             if data.get("gps_fix_stored", False) and not data.get("gps_valid", False):
                 data["position_cached"] = True
             if data.get("gps_valid", False):
@@ -232,10 +254,15 @@ class NeuroGoruWindow(QMainWindow):
                 has_displayed_position = latitude != 0.0 or longitude != 0.0
                 if has_displayed_position:
                     fence_latitude, fence_longitude, fence_radius = self.last_fence
-                    center_distance = self._distance_meters(
-                        latitude, longitude, fence_latitude, fence_longitude
-                    )
-                    boundary_distance = float(fence_radius) - center_distance
+                    north = (latitude - fence_latitude) * 111_320.0
+                    east = (longitude - fence_longitude) * 111_320.0 * math.cos(math.radians(fence_latitude))
+                    radius = float(fence_radius)
+                    shape = self.last_fence_shape
+                    vertical_ratio = 0.70 if shape == "oval" else 0.65 if shape == "rectangle" else 1.0
+                    x = abs(east) / max(0.1, radius)
+                    y = abs(north) / max(0.1, radius * vertical_ratio)
+                    normalized = max(x, y) if shape in {"square", "rectangle"} else math.hypot(x, y)
+                    boundary_distance = (1.0 - normalized) * radius
                     data["fence_distance"] = round(boundary_distance, 1)
                     data["fence_status"] = "inside" if boundary_distance >= 0.0 else "outside"
             except (KeyError, TypeError, ValueError):
@@ -269,6 +296,7 @@ class NeuroGoruWindow(QMainWindow):
         elif message.startswith("ALERT:FALL_DEMO:"):
             alert_message = message.split(":", 2)[2]
             self._add_alert("Fall Detection", alert_message, "Critical")
+            QApplication.beep()
             QMessageBox.critical(
                 self,
                 "EMERGENCY FALL ALERT",

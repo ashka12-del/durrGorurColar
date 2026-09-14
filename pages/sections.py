@@ -4,7 +4,7 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
 from styles.theme import ACCENT, DANGER, INFO, MUTED, WARNING
 from widgets.common import PageHeader
@@ -12,7 +12,7 @@ from widgets.map_widget import TelemetryMap
 
 
 class MapPage(QWidget):
-    fence_submitted = Signal(float, float, float)
+    fence_submitted = Signal(float, float, float, str)
     fence_previewed = Signal(float, float, float)
     demo_cow_submitted = Signal(float, float)
     demo_reset_requested = Signal()
@@ -33,6 +33,11 @@ class MapPage(QWidget):
         self.hint = QLabel("Hover red dot for GPS coordinates  •  Hover fence edge for radius and distance")
         self.hint.setStyleSheet(f"color:{MUTED};font-weight:700")
         controls = QHBoxLayout()
+        self.shape_selector = QComboBox()
+        self.shape_selector.addItems(["Circle", "Oval", "Square", "Rectangle"])
+        self.shape_selector.currentTextChanged.connect(self._shape_changed)
+        controls.addWidget(QLabel("Fence shape"))
+        controls.addWidget(self.shape_selector)
         controls.addStretch()
         self.edit_button = QPushButton("Edit Fence")
         self.edit_button.clicked.connect(self._begin_edit)
@@ -96,6 +101,17 @@ class MapPage(QWidget):
     def set_fence(self, latitude: float, longitude: float, radius: float) -> None:
         self.map.set_fence(latitude, longitude, radius)
 
+    def set_fence_shape(self, shape: str) -> None:
+        self.shape_selector.blockSignals(True)
+        self.shape_selector.setCurrentText(shape.title())
+        self.shape_selector.blockSignals(False)
+        self.map.set_fence_shape(shape)
+
+    def _shape_changed(self, shape: str) -> None:
+        self.map.set_fence_shape(shape)
+        if self.map._editable:
+            self.update_button.setEnabled(True)
+
     def _begin_edit(self) -> None:
         self._original_fence = self.map.fence
         self.map.set_editable(True)
@@ -115,7 +131,7 @@ class MapPage(QWidget):
 
     def _apply_edit(self) -> None:
         if self.map.fence:
-            self.fence_submitted.emit(*self.map.fence)
+            self.fence_submitted.emit(*self.map.fence, self.map.fence_shape)
         self._finish_edit()
 
     def _cancel_edit(self) -> None:

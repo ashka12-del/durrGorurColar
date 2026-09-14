@@ -3,8 +3,9 @@
 
   DS18B20: DATA GPIO4 with a 4.7k resistor from DATA to 3.3V
   MPU6050: SDA GPIO21, SCL GPIO22
-  NEO-6M:  TX GPIO16 (ESP32 RX2), RX GPIO17 (ESP32 TX2)
-  KY-012:  S GPIO25, + 3.3V, - GND
+  NEO-6M:  TX GPIO5 (ESP32 RX2), RX GPIO17 (ESP32 TX2)
+  Passive buzzer: GPIO15 to GND
+  MX1508: IN1 GPIO26, IN2 GPIO25
 */
 
 #include <WiFi.h>
@@ -13,6 +14,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <TinyGPSPlus.h>
+#include <Adafruit_MPU6050.h>
 #include <math.h>
 
 const char *AP_NAME = "NeuroGoru-ESP32";
@@ -22,16 +24,21 @@ const char *OTA_PASSWORD = "NeuroGoru123";
 const uint16_t TCP_PORT = 5010;
 
 const uint8_t DS18B20_PIN = 4;
-const uint8_t MPU6050_ADDRESS = 0x68;
-const uint8_t GPS_RX_PIN = 16;
+uint8_t mpu6050Address = 0x68;
+const uint8_t GPS_RX_PIN = 5;
 const uint8_t GPS_TX_PIN = 17;
-const uint8_t BUZZER_PIN = 25;
+const uint8_t BUZZER_PIN = 15;
 const uint8_t ONBOARD_LED_PIN = 2;
-const uint8_t VIBRATION_MOTOR_PIN = 32;
-// The installed module is explicitly marked low-level trigger.
-const uint8_t BUZZER_ON_LEVEL = LOW;
+const uint8_t MOTOR_IN1_PIN = 26;
+const uint8_t MOTOR_IN2_PIN = 25;
 const unsigned long ONLINE_LED_INTERVAL_MS = 500;
-const unsigned long FENCE_10M_MOTOR_TEST_MS = 1000;
+const unsigned long DS18B20_RETRY_MS = 5000;
+const unsigned long MPU6050_RETRY_MS = 5000;
+const unsigned long GEOFENCE_CHECK_INTERVAL_MS = 1000;
+const unsigned long GPS_MAX_AGE_MS = 5000;
+const uint8_t MIN_GPS_SATELLITES = 4;
+const uint8_t OUTSIDE_SAMPLES_TO_ALARM = 3;
+const double MIN_FENCE_RADIUS_METERS = 5.0;
 
 WiFiServer server(TCP_PORT);
 WiFiClient dashboardClient;
@@ -39,11 +46,17 @@ OneWire oneWire(DS18B20_PIN);
 DallasTemperature temperatureSensor(&oneWire);
 HardwareSerial gpsSerial(2);
 TinyGPSPlus gps;
+Adafruit_MPU6050 mpu;
 
 String receiveBuffer;
 bool ds18b20Online = false;
 bool mpu6050Online = false;
 bool gpsOnline = false;
+bool hasStoredGpsFix = false;
+double storedGpsLatitude = 0.0;
+double storedGpsLongitude = 0.0;
+double storedGpsAltitude = 0.0;
+unsigned long storedGpsFixAtMs = 0;
 bool demoCowPositionActive = false;
 double demoCowLatitude = 0.0;
 double demoCowLongitude = 0.0;
@@ -54,63 +67,67 @@ unsigned long lastTelemetryMs = 0;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastTemperatureAlertMs = 0;
 unsigned long lastOnlineLedMs = 0;
+unsigned long lastDs18b20RetryMs = 0;
+unsigned long lastMpu6050RetryMs = 0;
 bool onlineLedState = false;
 bool fenceBuzzerActive = false;
-unsigned long vibrationMotorUntilMs = 0;
+bool fenceAlarmActive = false;
+bool buzzerOutputActive = false;
+bool fenceSet = false;
+uint8_t outsideFenceSamples = 0;
+unsigned long lastGeofenceCheckMs = 0;
 
 // Deadline demo mode: a strong shake is treated as a simulated fall.
 // This is intentionally separate from the ML prototype and must not be
 // described as validated real-cattle fall detection.
-const float DEMO_SHAKE_DELTA_G = 0.75f;
-const float DEMO_IMPACT_G = 1.80f;
+const float DEMO_SHAKE_DELTA_G = 1.75f;
+const float DEMO_IMPACT_G = 2.80f;
 const unsigned long DEMO_MPU_SAMPLE_MS = 50;
 const unsigned long DEMO_FALL_COOLDOWN_MS = 10000;
-const unsigned long DEMO_BUZZER_MS = 2500;
+const unsigned long DEMO_FALL_SETTLE_MS = 5000;
+const uint8_t DEMO_STRONG_SAMPLES_REQUIRED = 3;
 unsigned long lastDemoMpuSampleMs = 0;
 unsigned long lastDemoFallAlertMs = 0;
-unsigned long demoFallBuzzerUntilMs = 0;
+uint8_t consecutiveStrongMotionSamples = 0;
 float previousDemoAx = 0.0f;
 float previousDemoAy = 0.0f;
 float previousDemoAz = 0.0f;
 bool previousDemoSampleValid = false;
 
 void setBuzzer(bool enabled) {
-  digitalWrite(BUZZER_PIN, enabled ? BUZZER_ON_LEVEL : !BUZZER_ON_LEVEL);
+  if (buzzerOutputActive == enabled) return;
+  buzzerOutputActive = enabled;
+  if (enabled) tone(BUZZER_PIN, 2000);
+  else noTone(BUZZER_PIN);
+}
+
+// Exact MX1508 motor control used by Fahim4588/Cow_Collar.
+void motor(bool on) {
+  digitalWrite(MOTOR_IN1_PIN, on ? HIGH : LOW);
+  digitalWrite(MOTOR_IN2_PIN, LOW);
 }
 
 void updateBuzzerOutput() {
-  const unsigned long now = millis();
-  const bool demoFallActive = now < demoFallBuzzerUntilMs;
-  setBuzzer(fenceBuzzerActive || demoFallActive);
-}
-
-void setVibrationMotor(bool enabled) {
-  // GPIO32 drives the 2N2222A base through the series resistor.
-  digitalWrite(VIBRATION_MOTOR_PIN, enabled ? HIGH : LOW);
-}
-
-void runVibrationMotorFor(unsigned long durationMs) {
-  vibrationMotorUntilMs = millis() + durationMs;
-  setVibrationMotor(true);
-}
-
-void updateVibrationMotor() {
-  // Fail-safe default: unless an explicit 10 m test timer is active, drive
-  // GPIO32 LOW on every loop pass.
-  if (vibrationMotorUntilMs == 0) {
-    setVibrationMotor(false);
-    return;
-  }
-  if (static_cast<long>(millis() - vibrationMotorUntilMs) >= 0) {
-    vibrationMotorUntilMs = 0;
-    setVibrationMotor(false);
-    Serial.println("VIBRATION MOTOR: test complete, motor OFF");
-  }
+  // The passive buzzer is reserved exclusively for fence-boundary warnings.
+  setBuzzer(fenceBuzzerActive);
 }
 
 double fenceLatitude = 23.8376;
 double fenceLongitude = 90.3576;
 double fenceRadiusMeters = 250.0;
+String fenceShape = "circle";
+
+void setAlarm(bool enabled) {
+  const bool stateChanged = fenceAlarmActive != enabled;
+  fenceAlarmActive = enabled;
+  fenceBuzzerActive = enabled;
+  motor(enabled);
+  updateBuzzerOutput();
+  if (!stateChanged) return;
+  sendLine(enabled
+      ? "ALERT:GEOFENCE:Outside fence - buzzer and vibration enabled"
+      : "STATUS:GEOFENCE:Inside fence - alarm stopped");
+}
 
 void sendLine(const String &message) {
   if (dashboardClient && dashboardClient.connected()) dashboardClient.println(message);
@@ -118,29 +135,23 @@ void sendLine(const String &message) {
 }
 
 bool initializeMpu6050() {
-  Wire.beginTransmission(MPU6050_ADDRESS);
-  Wire.write(0x6B);
-  Wire.write(0x00);
-  if (Wire.endTransmission() != 0) return false;
-  delay(50);
-  Wire.beginTransmission(MPU6050_ADDRESS);
-  Wire.write(0x75);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom(MPU6050_ADDRESS, (uint8_t)1) != 1) return false;
-  return Wire.read() == 0x68;
+  if (mpu.begin(0x68, &Wire)) {
+    mpu6050Address = 0x68;
+    return true;
+  }
+  if (mpu.begin(0x69, &Wire)) {
+    mpu6050Address = 0x69;
+    return true;
+  }
+  return false;
 }
 
 bool readMpu6050(float &ax, float &ay, float &az) {
-  Wire.beginTransmission(MPU6050_ADDRESS);
-  Wire.write(0x3B);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom(MPU6050_ADDRESS, (uint8_t)6) != 6) return false;
-  int16_t rawAx = (Wire.read() << 8) | Wire.read();
-  int16_t rawAy = (Wire.read() << 8) | Wire.read();
-  int16_t rawAz = (Wire.read() << 8) | Wire.read();
-  ax = rawAx / 16384.0f;
-  ay = rawAy / 16384.0f;
-  az = rawAz / 16384.0f;
+  sensors_event_t acceleration, gyro, temperature;
+  if (!mpu.getEvent(&acceleration, &gyro, &temperature)) return false;
+  ax = acceleration.acceleration.x / SENSORS_GRAVITY_STANDARD;
+  ay = acceleration.acceleration.y / SENSORS_GRAVITY_STANDARD;
+  az = acceleration.acceleration.z / SENSORS_GRAVITY_STANDARD;
   return true;
 }
 
@@ -151,10 +162,16 @@ void checkDemoFallDetection() {
   float ax = 0.0f, ay = 0.0f, az = 0.0f;
   if (!readMpu6050(ax, ay, az)) {
     previousDemoSampleValid = false;
+    consecutiveStrongMotionSamples = 0;
     return;
   }
 
   float magnitude = sqrtf(ax * ax + ay * ay + az * az);
+  if (!isfinite(magnitude) || magnitude > 8.0f) {
+    previousDemoSampleValid = false;
+    consecutiveStrongMotionSamples = 0;
+    return;
+  }
   float delta = 0.0f;
   if (previousDemoSampleValid) {
     float dx = ax - previousDemoAx;
@@ -173,10 +190,21 @@ void checkDemoFallDetection() {
       (delta >= DEMO_SHAKE_DELTA_G || magnitude >= DEMO_IMPACT_G);
   previousDemoSampleValid = true;
 
-  if (strongShake && cooldownFinished) {
+  if (millis() < DEMO_FALL_SETTLE_MS) {
+    consecutiveStrongMotionSamples = 0;
+    return;
+  }
+  if (strongShake) {
+    if (consecutiveStrongMotionSamples < DEMO_STRONG_SAMPLES_REQUIRED) {
+      consecutiveStrongMotionSamples++;
+    }
+  } else {
+    consecutiveStrongMotionSamples = 0;
+  }
+
+  if (consecutiveStrongMotionSamples >= DEMO_STRONG_SAMPLES_REQUIRED && cooldownFinished) {
+    consecutiveStrongMotionSamples = 0;
     lastDemoFallAlertMs = millis();
-    demoFallBuzzerUntilMs = millis() + DEMO_BUZZER_MS;
-    setBuzzer(true);
     sendLine("ALERT:FALL_DEMO:EMERGENCY - simulated cattle fall detected from MPU6050 shake. Verify the animal immediately.");
     Serial.println("DEMO_FALL_VALUES: magnitude=" + String(magnitude, 2) +
                    "g delta=" + String(delta, 2) + "g");
@@ -191,6 +219,72 @@ double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
   double dl = (lon2 - lon1) * DEG_TO_RAD;
   double a = sin(dp / 2) * sin(dp / 2) + cos(p1) * cos(p2) * sin(dl / 2) * sin(dl / 2);
   return earthRadius * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+}
+
+double normalizedFenceDistance(double latitude, double longitude) {
+  const double north = (latitude - fenceLatitude) * 111320.0;
+  const double east = (longitude - fenceLongitude) * 111320.0 *
+      cos(fenceLatitude * DEG_TO_RAD);
+  if (fenceShape == "oval") {
+    return sqrt(
+        (east * east) / (fenceRadiusMeters * fenceRadiusMeters) +
+        (north * north) / (0.70 * fenceRadiusMeters * 0.70 * fenceRadiusMeters));
+  }
+  if (fenceShape == "square") {
+    return max(abs(east), abs(north)) / fenceRadiusMeters;
+  }
+  if (fenceShape == "rectangle") {
+    return max(abs(east) / fenceRadiusMeters,
+        abs(north) / (0.65 * fenceRadiusMeters));
+  }
+  return sqrt(east * east + north * north) / fenceRadiusMeters;
+}
+
+bool gpsReadyForGeofence() {
+  return gps.location.isValid() &&
+      gps.location.age() < GPS_MAX_AGE_MS &&
+      gps.satellites.isValid() &&
+      gps.satellites.value() >= MIN_GPS_SATELLITES;
+}
+
+void evaluateGeofence() {
+  if (millis() - lastGeofenceCheckMs < GEOFENCE_CHECK_INTERVAL_MS) return;
+  lastGeofenceCheckMs = millis();
+
+  if (!fenceSet) {
+    outsideFenceSamples = 0;
+    setAlarm(false);
+    return;
+  }
+
+  // Match the reference Cow_Collar behavior: physical alarms are controlled
+  // only by a fresh real GPS fix with at least four satellites. The dashboard's
+  // demo cow remains visual-only and can never switch the real motor/buzzer.
+  if (!gpsReadyForGeofence()) {
+    outsideFenceSamples = 0;
+      setAlarm(false);
+    return;
+  }
+  const double latitude = gps.location.lat();
+  const double longitude = gps.location.lng();
+
+  const double normalizedDistance = normalizedFenceDistance(latitude, longitude);
+  if (normalizedDistance > 1.0) {
+    // Outside the circle: warn immediately, then start the motor only after
+    // three consecutive outside readings to reject a single GPS jump.
+    fenceBuzzerActive = true;
+    updateBuzzerOutput();
+    if (outsideFenceSamples < OUTSIDE_SAMPLES_TO_ALARM) outsideFenceSamples++;
+    if (outsideFenceSamples >= OUTSIDE_SAMPLES_TO_ALARM) setAlarm(true);
+  } else {
+    // Back inside: the motor stops immediately. The buzzer sounds only in the
+    // final 20% of the radius (minimum 2 m, maximum 10 m) near the boundary.
+    outsideFenceSamples = 0;
+    setAlarm(false);
+    const double warningDistance = constrain(fenceRadiusMeters * 0.20, 2.0, 10.0);
+    fenceBuzzerActive = normalizedDistance >= 1.0 - warningDistance / fenceRadiusMeters;
+    updateBuzzerOutput();
+  }
 }
 
 void sendSensorStatus() {
@@ -225,21 +319,29 @@ void handleCommand(String command) {
     String values = command.substring(10);
     int firstComma = values.indexOf(',');
     int secondComma = values.indexOf(',', firstComma + 1);
+    int thirdComma = values.indexOf(',', secondComma + 1);
     if (firstComma > 0 && secondComma > firstComma) {
-      fenceLatitude = values.substring(0, firstComma).toDouble();
-      fenceLongitude = values.substring(firstComma + 1, secondComma).toDouble();
-      fenceRadiusMeters = values.substring(secondComma + 1).toDouble();
-      sendLine("ACK:FENCE:UPDATED");
-      // Bench test requested by the UI: applying exactly 10.0 m runs the
-      // motor for one second even when GPS does not yet have a valid fix.
-      if (fabs(fenceRadiusMeters - 10.0) < 0.05) {
-        runVibrationMotorFor(FENCE_10M_MOTOR_TEST_MS);
-        sendLine("ACK:MOTOR:TESTING_1000MS");
-        Serial.println("VIBRATION MOTOR: 10 m fence test started");
+      const double latitude = values.substring(0, firstComma).toDouble();
+      const double longitude = values.substring(firstComma + 1, secondComma).toDouble();
+      const double radius = values.substring(
+          secondComma + 1, thirdComma > secondComma ? thirdComma : values.length()).toDouble();
+      String requestedShape = thirdComma > secondComma
+          ? values.substring(thirdComma + 1) : "circle";
+      requestedShape.toLowerCase();
+      const bool validShape = requestedShape == "circle" || requestedShape == "oval" ||
+          requestedShape == "square" || requestedShape == "rectangle";
+      if (latitude < -90.0 || latitude > 90.0 || longitude < -180.0 ||
+          longitude > 180.0 || radius < MIN_FENCE_RADIUS_METERS || radius > 100000.0 || !validShape) {
+        sendLine("ALERT:Invalid fence coordinate or radius (minimum 5 m)");
       } else {
-        vibrationMotorUntilMs = 0;
-        setVibrationMotor(false);
-        sendLine("ACK:MOTOR:OFF");
+        fenceLatitude = latitude;
+        fenceLongitude = longitude;
+        fenceRadiusMeters = radius;
+        fenceShape = requestedShape;
+        fenceSet = true;
+        outsideFenceSamples = 0;
+        setAlarm(false);
+        sendLine("ACK:FENCE:UPDATED");
       }
     } else sendLine("ALERT:Invalid fence command");
   } else if (command == "DEMO_COW:OFF") {
@@ -259,6 +361,27 @@ void handleCommand(String command) {
 }
 
 void sendTelemetry() {
+  // A DS18B20 connected after boot (or after a loose-wire interruption) must
+  // be rediscovered without restarting the ESP32.
+  if (!ds18b20Online && millis() - lastDs18b20RetryMs >= DS18B20_RETRY_MS) {
+    lastDs18b20RetryMs = millis();
+    temperatureSensor.begin();
+    if (temperatureSensor.getDeviceCount() > 0) {
+      ds18b20FailureCount = 0;
+      ds18b20Online = true;
+      sendLine("STATUS:DS18B20:ONLINE");
+      Serial.println("DS18B20: rediscovered");
+    }
+  }
+  if (!mpu6050Online && millis() - lastMpu6050RetryMs >= MPU6050_RETRY_MS) {
+    lastMpu6050RetryMs = millis();
+    if (initializeMpu6050()) {
+      mpu6050FailureCount = 0;
+      mpu6050Online = true;
+      sendLine("STATUS:MPU6050:ONLINE");
+      Serial.println("MPU6050: rediscovered at I2C address 0x" + String(mpu6050Address, HEX));
+    }
+  }
   temperatureSensor.requestTemperatures();
   float temperature = temperatureSensor.getTempCByIndex(0);
   bool temperatureValid = temperature != DEVICE_DISCONNECTED_C && temperature > -55.0f && temperature < 125.0f;
@@ -275,29 +398,36 @@ void sendTelemetry() {
   updateSensorState(stableDsState, stableMpuState, currentGpsState);
 
   bool gpsValid = gps.location.isValid() && gps.location.age() < 5000;
-  bool positionValid = gpsValid || demoCowPositionActive;
+  if (gpsValid) {
+    storedGpsLatitude = gps.location.lat();
+    storedGpsLongitude = gps.location.lng();
+    if (gps.altitude.isValid()) storedGpsAltitude = gps.altitude.meters();
+    storedGpsFixAtMs = millis();
+    hasStoredGpsFix = true;
+  }
+  bool positionValid = gpsValid || hasStoredGpsFix || demoCowPositionActive;
   uint32_t gpsSatellites = (currentGpsState && gps.satellites.isValid())
       ? gps.satellites.value()
       : 0;
-  double latitude = demoCowPositionActive ? demoCowLatitude : (gpsValid ? gps.location.lat() : 0.0);
-  double longitude = demoCowPositionActive ? demoCowLongitude : (gpsValid ? gps.location.lng() : 0.0);
-  double altitude = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+  double latitude = demoCowPositionActive ? demoCowLatitude :
+      (hasStoredGpsFix ? storedGpsLatitude : 0.0);
+  double longitude = demoCowPositionActive ? demoCowLongitude :
+      (hasStoredGpsFix ? storedGpsLongitude : 0.0);
+  double altitude = demoCowPositionActive ? 0.0 :
+      (hasStoredGpsFix ? storedGpsAltitude : 0.0);
   double signedFenceDistance = 0.0;
   String fenceStatus = "waiting";
   bool fenceBreached = false;
   if (positionValid) {
-    double centerDistance = distanceMeters(latitude, longitude, fenceLatitude, fenceLongitude);
-    signedFenceDistance = fenceRadiusMeters - centerDistance;
+    const double normalizedDistance = normalizedFenceDistance(latitude, longitude);
+    signedFenceDistance = (1.0 - normalizedDistance) * fenceRadiusMeters;
     // Treat the boundary itself as a breach for the indoor demonstration.
     fenceBreached = signedFenceDistance <= 0;
     fenceStatus = fenceBreached ? "outside" : "inside";
   }
-  fenceBuzzerActive = fenceBreached;
-  updateBuzzerOutput();
-
   String json = "TELEMETRY:{";
-  json += "\"latitude\":" + String(positionValid ? latitude : 0.0, 8);
-  json += ",\"longitude\":" + String(positionValid ? longitude : 0.0, 8);
+  json += "\"latitude\":" + String(positionValid ? latitude : 0.0, 6);
+  json += ",\"longitude\":" + String(positionValid ? longitude : 0.0, 6);
   json += ",\"altitude\":" + String(altitude, 1);
   json += ",\"temperature\":" + String(temperatureValid ? temperature : 0.0, 2);
   json += ",\"acceleration_x\":" + String(mpuValid ? ax : 0.0, 3);
@@ -305,8 +435,15 @@ void sendTelemetry() {
   json += ",\"acceleration_z\":" + String(mpuValid ? az : 0.0, 3);
   json += ",\"fence_distance\":" + String(signedFenceDistance, 1);
   json += ",\"fence_status\":\"" + fenceStatus + "\"";
+  json += ",\"fence_set\":" + String(fenceSet ? "true" : "false");
+  json += ",\"fence_latitude\":" + String(fenceLatitude, 8);
+  json += ",\"fence_longitude\":" + String(fenceLongitude, 8);
+  json += ",\"fence_radius\":" + String(fenceRadiusMeters, 1);
+  json += ",\"fence_shape\":\"" + fenceShape + "\"";
   json += ",\"gps_detected\":" + String(currentGpsState ? "true" : "false");
   json += ",\"gps_valid\":" + String(gpsValid ? "true" : "false");
+  json += ",\"gps_fix_stored\":" + String(hasStoredGpsFix ? "true" : "false");
+  json += ",\"gps_fix_age_seconds\":" + String(hasStoredGpsFix ? (millis() - storedGpsFixAtMs) / 1000UL : 0);
   json += ",\"gps_satellites\":" + String(gpsSatellites);
   json += ",\"position_valid\":" + String(positionValid ? "true" : "false");
   json += ",\"demo_position_active\":" + String(demoCowPositionActive ? "true" : "false");
@@ -320,20 +457,17 @@ void sendTelemetry() {
 }
 
 void setup() {
-  // Configure the motor output before Serial, Wi-Fi, or sensors so the
-  // transistor cannot remain enabled during application startup.
-  digitalWrite(VIBRATION_MOTOR_PIN, LOW);
-  pinMode(VIBRATION_MOTOR_PIN, OUTPUT);
-  setVibrationMotor(false);
-  vibrationMotorUntilMs = 0;
+  // Start both alarm outputs OFF. Geofence evaluation controls them together.
+  pinMode(MOTOR_IN1_PIN, OUTPUT);
+  pinMode(MOTOR_IN2_PIN, OUTPUT);
+  motor(false);
 
   Serial.begin(115200);
   pinMode(ONBOARD_LED_PIN, OUTPUT);
   digitalWrite(ONBOARD_LED_PIN, LOW);
-  // Write the inactive level before enabling the output to avoid a low pulse.
-  digitalWrite(BUZZER_PIN, !BUZZER_ON_LEVEL);
   pinMode(BUZZER_PIN, OUTPUT);
-  setBuzzer(false);
+  noTone(BUZZER_PIN);
+  buzzerOutputActive = false;
   Wire.begin(21, 22);
   temperatureSensor.begin();
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -351,8 +485,9 @@ void setup() {
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.onStart([]() {
-    setBuzzer(false);
-    Serial.println("OTA update starting; buzzer forced OFF");
+    setAlarm(false);
+    updateBuzzerOutput();
+    Serial.println("OTA update starting; alarm outputs forced OFF");
   });
   ArduinoOTA.onEnd([]() {
     setBuzzer(false);
@@ -398,9 +533,6 @@ void loop() {
       dashboardClient = incoming;
       dashboardClient.setNoDelay(true);
       receiveBuffer = "";
-      // A UI connection must never start the motor.
-      vibrationMotorUntilMs = 0;
-      setVibrationMotor(false);
       sendLine("HELLO:NEUROGORU_ESP32");
       sendLine("STATUS:ESP32:ONLINE");
       sendSensorStatus();
@@ -425,12 +557,12 @@ void loop() {
   // Sensor monitoring and the buzzer must keep working even when the
   // dashboard/laptop is disconnected.
   if (mpu6050Online) checkDemoFallDetection();
+  evaluateGeofence();
 
   if (millis() - lastTelemetryMs >= 2000) {
     lastTelemetryMs = millis();
     sendTelemetry();
   }
   updateBuzzerOutput();
-  updateVibrationMotor();
   delay(2);
 }

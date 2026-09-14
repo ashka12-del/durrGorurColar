@@ -19,8 +19,8 @@ class Esp32Client(QObject):
         self.socket.flush()
         return True
 
-    def set_fence(self, latitude: float, longitude: float, radius: float) -> bool:
-        return self.send_line(f"SET_FENCE:{latitude:.8f},{longitude:.8f},{radius:.1f}")
+    def set_fence(self, latitude: float, longitude: float, radius: float, shape: str = "circle") -> bool:
+        return self.send_line(f"SET_FENCE:{latitude:.8f},{longitude:.8f},{radius:.1f},{shape.lower()}")
 
     def set_demo_cow_position(self, latitude: float, longitude: float) -> bool:
         return self.send_line(f"DEMO_COW:{latitude:.8f},{longitude:.8f}")
