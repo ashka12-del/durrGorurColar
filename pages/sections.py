@@ -113,12 +113,25 @@ class MapPage(QWidget):
             self.update_button.setEnabled(True)
 
     def _begin_edit(self) -> None:
+        # Always recover from an interrupted cow-demo drag so Edit Fence cannot
+        # remain disabled or appear unresponsive.
+        self.map.set_cow_editable(False)
+        self.demo_cow_button.setEnabled(False)
+        self.edit_button.setEnabled(True)
+
+        # If no fence has arrived yet, create a local preview around the latest
+        # cow/GPS position (or the project's default origin) so editing still
+        # works while the ESP32 is offline.
+        if self.map.fence is None:
+            center = self.map._gps_position() or (23.8376, 90.3576)
+            self.map.set_fence(center[0], center[1], 25.0)
+
         self._original_fence = self.map.fence
         self.map.set_editable(True)
         self.edit_button.setVisible(False)
         self.cancel_button.setVisible(True)
         self.update_button.setVisible(True)
-        self.update_button.setEnabled(False)
+        self.update_button.setEnabled(True)
         self.hint.setText("EDIT MODE  •  Drag green handles to resize  •  Drag shaded area to move entire fence  •  Update Fence to save")
 
     def _fence_moved(self, latitude: float, longitude: float, radius: float) -> None:
@@ -143,6 +156,8 @@ class MapPage(QWidget):
     def _finish_edit(self) -> None:
         self.map.set_editable(False)
         self.edit_button.setVisible(True)
+        self.edit_button.setEnabled(True)
+        self.demo_cow_button.setEnabled(True)
         self.cancel_button.setVisible(False)
         self.update_button.setVisible(False)
         self.hint.setText("Hover red dot for GPS coordinates  •  Hover fence edge for radius and distance")

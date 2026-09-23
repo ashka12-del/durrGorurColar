@@ -1,7 +1,7 @@
 /*
   NeuroGoru combined ESP32 backend
 
-  DS18B20: DATA GPIO4 with a 4.7k resistor from DATA to 3.3V
+  DS18B20: DATA GPIO13 with a 4.7k resistor from DATA to 3.3V
   MPU6050: SDA GPIO21, SCL GPIO22
   NEO-6M:  TX GPIO5 (ESP32 RX2), RX GPIO17 (ESP32 TX2)
   Passive buzzer: GPIO15 to GND
@@ -23,7 +23,7 @@ const char *OTA_HOSTNAME = "neurogoru-esp32";
 const char *OTA_PASSWORD = "NeuroGoru123";
 const uint16_t TCP_PORT = 5010;
 
-const uint8_t DS18B20_PIN = 4;
+const uint8_t DS18B20_PIN = 13;
 uint8_t mpu6050Address = 0x68;
 const uint8_t GPS_RX_PIN = 5;
 const uint8_t GPS_TX_PIN = 17;
@@ -77,18 +77,35 @@ bool fenceSet = false;
 uint8_t outsideFenceSamples = 0;
 unsigned long lastGeofenceCheckMs = 0;
 
-// Deadline demo mode: a strong shake is treated as a simulated fall.
+// Gentle box-test fall mode: calibrate the normal gravity direction, then
+// detect a sustained orientation change. No hard impact is required.
 // This is intentionally separate from the ML prototype and must not be
 // described as validated real-cattle fall detection.
-const float DEMO_SHAKE_DELTA_G = 1.75f;
-const float DEMO_IMPACT_G = 2.80f;
-const unsigned long DEMO_MPU_SAMPLE_MS = 50;
-const unsigned long DEMO_FALL_COOLDOWN_MS = 10000;
-const unsigned long DEMO_FALL_SETTLE_MS = 5000;
-const uint8_t DEMO_STRONG_SAMPLES_REQUIRED = 3;
+const float DEMO_FALL_TILT_DEGREES = 25.0f;
+const float DEMO_FALL_RECOVERY_DEGREES = 12.0f;
+const uint8_t DEMO_FALL_TILT_SAMPLES_REQUIRED = 8;
+const uint8_t DEMO_FALL_RECOVERY_SAMPLES_REQUIRED = 12;
+const uint8_t DEMO_BASELINE_SAMPLES_REQUIRED = 40;
+// Demonstration thresholds: a short, gentle drop should produce a small
+// low-gravity dip followed by a landing pulse. Requiring that sequence avoids
+// treating ordinary movement as a fall.
+const float DEMO_DROP_LOW_RATIO = 0.98f;
+const float DEMO_DROP_LANDING_RATIO = 1.02f;
+const uint8_t DEMO_DROP_LOW_SAMPLES_REQUIRED = 1;
+const unsigned long DEMO_DROP_WINDOW_MS = 1500;
+const unsigned long DEMO_MPU_SAMPLE_MS = 10;
+const unsigned long DEMO_FALL_COOLDOWN_MS = 5000;
+const unsigned long DEMO_FALL_SETTLE_MS = 2000;
 unsigned long lastDemoMpuSampleMs = 0;
 unsigned long lastDemoFallAlertMs = 0;
-uint8_t consecutiveStrongMotionSamples = 0;
+float baselineAx = 0.0f, baselineAy = 0.0f, baselineAz = 0.0f;
+uint8_t baselineSampleCount = 0;
+uint8_t tiltSampleCount = 0;
+uint8_t recoverySampleCount = 0;
+bool fallTiltLatched = false;
+bool demoDropStarted = false;
+unsigned long demoDropStartedMs = 0;
+uint8_t demoDropLowSampleCount = 0;
 float previousDemoAx = 0.0f;
 float previousDemoAy = 0.0f;
 float previousDemoAz = 0.0f;
@@ -137,10 +154,14 @@ void sendLine(const String &message) {
 bool initializeMpu6050() {
   if (mpu.begin(0x68, &Wire)) {
     mpu6050Address = 0x68;
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
     return true;
   }
   if (mpu.begin(0x69, &Wire)) {
     mpu6050Address = 0x69;
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
     return true;
   }
   return false;
@@ -161,53 +182,110 @@ void checkDemoFallDetection() {
 
   float ax = 0.0f, ay = 0.0f, az = 0.0f;
   if (!readMpu6050(ax, ay, az)) {
-    previousDemoSampleValid = false;
-    consecutiveStrongMotionSamples = 0;
+    tiltSampleCount = 0;
+    recoverySampleCount = 0;
+    demoDropLowSampleCount = 0;
+    demoDropStarted = false;
     return;
   }
 
-  float magnitude = sqrtf(ax * ax + ay * ay + az * az);
-  if (!isfinite(magnitude) || magnitude > 8.0f) {
-    previousDemoSampleValid = false;
-    consecutiveStrongMotionSamples = 0;
+  const float magnitude = sqrtf(ax * ax + ay * ay + az * az);
+  if (!isfinite(magnitude) || magnitude < 0.20f || magnitude > 8.0f) {
+    tiltSampleCount = 0;
+    recoverySampleCount = 0;
     return;
   }
-  float delta = 0.0f;
-  if (previousDemoSampleValid) {
-    float dx = ax - previousDemoAx;
-    float dy = ay - previousDemoAy;
-    float dz = az - previousDemoAz;
-    delta = sqrtf(dx * dx + dy * dy + dz * dz);
-  }
-
-  previousDemoAx = ax;
-  previousDemoAy = ay;
-  previousDemoAz = az;
-
-  bool cooldownFinished = lastDemoFallAlertMs == 0 ||
-      millis() - lastDemoFallAlertMs >= DEMO_FALL_COOLDOWN_MS;
-  bool strongShake = previousDemoSampleValid &&
-      (delta >= DEMO_SHAKE_DELTA_G || magnitude >= DEMO_IMPACT_G);
-  previousDemoSampleValid = true;
 
   if (millis() < DEMO_FALL_SETTLE_MS) {
-    consecutiveStrongMotionSamples = 0;
     return;
   }
-  if (strongShake) {
-    if (consecutiveStrongMotionSamples < DEMO_STRONG_SAMPLES_REQUIRED) {
-      consecutiveStrongMotionSamples++;
+
+  if (baselineSampleCount < DEMO_BASELINE_SAMPLES_REQUIRED) {
+    baselineAx += ax;
+    baselineAy += ay;
+    baselineAz += az;
+    baselineSampleCount++;
+    if (baselineSampleCount == DEMO_BASELINE_SAMPLES_REQUIRED) {
+      baselineAx /= DEMO_BASELINE_SAMPLES_REQUIRED;
+      baselineAy /= DEMO_BASELINE_SAMPLES_REQUIRED;
+      baselineAz /= DEMO_BASELINE_SAMPLES_REQUIRED;
+      Serial.println("FALL_TEST: orientation baseline ready; gently lay box on its side");
     }
-  } else {
-    consecutiveStrongMotionSamples = 0;
+    return;
   }
 
-  if (consecutiveStrongMotionSamples >= DEMO_STRONG_SAMPLES_REQUIRED && cooldownFinished) {
-    consecutiveStrongMotionSamples = 0;
+  const float baselineMagnitude = sqrtf(
+      baselineAx * baselineAx + baselineAy * baselineAy + baselineAz * baselineAz);
+  const float dot = ax * baselineAx + ay * baselineAy + az * baselineAz;
+  const float cosine = constrain(dot / (magnitude * baselineMagnitude), -1.0f, 1.0f);
+  const float tiltDegrees = acosf(cosine) * 180.0f / PI;
+  const float gravityRatio = magnitude / baselineMagnitude;
+  const bool cooldownFinished = lastDemoFallAlertMs == 0 ||
+      millis() - lastDemoFallAlertMs >= DEMO_FALL_COOLDOWN_MS;
+
+  // Gentle-drop detector: first observe a brief reduction in apparent gravity,
+  // then a modest landing increase. Ratios make this tolerant of MPU6050 clones
+  // whose absolute acceleration scale is inaccurate.
+  if (!fallTiltLatched) {
+    if (!demoDropStarted) {
+      if (gravityRatio <= DEMO_DROP_LOW_RATIO) {
+        if (demoDropLowSampleCount < DEMO_DROP_LOW_SAMPLES_REQUIRED) {
+          ++demoDropLowSampleCount;
+        }
+        if (demoDropLowSampleCount >= DEMO_DROP_LOW_SAMPLES_REQUIRED) {
+          demoDropStarted = true;
+          demoDropStartedMs = millis();
+          Serial.println("FALL_TEST: low-gravity phase detected; waiting for landing");
+        }
+      } else {
+        demoDropLowSampleCount = 0;
+      }
+    } else if (millis() - demoDropStartedMs > DEMO_DROP_WINDOW_MS) {
+      demoDropStarted = false;
+      demoDropLowSampleCount = 0;
+    }
+  }
+
+  const bool gentleDropDetected = demoDropStarted &&
+      gravityRatio >= DEMO_DROP_LANDING_RATIO &&
+      millis() - demoDropStartedMs <= DEMO_DROP_WINDOW_MS;
+
+  if (!fallTiltLatched) {
+    if (tiltDegrees >= DEMO_FALL_TILT_DEGREES) {
+      if (tiltSampleCount < DEMO_FALL_TILT_SAMPLES_REQUIRED) {
+        ++tiltSampleCount;
+      }
+    } else {
+      tiltSampleCount = 0;
+    }
+  } else {
+    if (tiltDegrees <= DEMO_FALL_RECOVERY_DEGREES) {
+      if (recoverySampleCount < DEMO_FALL_RECOVERY_SAMPLES_REQUIRED) {
+        ++recoverySampleCount;
+      }
+    } else {
+      recoverySampleCount = 0;
+    }
+    if (recoverySampleCount >= DEMO_FALL_RECOVERY_SAMPLES_REQUIRED) {
+      fallTiltLatched = false;
+      recoverySampleCount = 0;
+      Serial.println("FALL_TEST: normal orientation restored; detector re-armed");
+    }
+  }
+
+  if (!fallTiltLatched &&
+      (tiltSampleCount >= DEMO_FALL_TILT_SAMPLES_REQUIRED || gentleDropDetected) &&
+      cooldownFinished) {
+    fallTiltLatched = true;
+    tiltSampleCount = 0;
+    demoDropStarted = false;
+    demoDropLowSampleCount = 0;
     lastDemoFallAlertMs = millis();
-    sendLine("ALERT:FALL_DEMO:EMERGENCY - simulated cattle fall detected from MPU6050 shake. Verify the animal immediately.");
-    Serial.println("DEMO_FALL_VALUES: magnitude=" + String(magnitude, 2) +
-                   "g delta=" + String(delta, 2) + "g");
+    sendLine(gentleDropDetected
+        ? "ALERT:FALL_DEMO:EMERGENCY - gentle drop and landing detected by MPU6050. Verify the animal immediately."
+        : "ALERT:FALL_DEMO:EMERGENCY - sustained cattle-collar tilt detected by MPU6050. Verify the animal immediately.");
+    Serial.println("DEMO_FALL_VALUES: tilt=" + String(tiltDegrees, 1) +
+        " degrees, gravity_ratio=" + String(gravityRatio, 2));
   }
 }
 

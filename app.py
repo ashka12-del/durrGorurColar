@@ -297,10 +297,12 @@ class NeuroGoruWindow(QMainWindow):
             alert_message = message.split(":", 2)[2]
             self._add_alert("Fall Detection", alert_message, "Critical")
             QApplication.beep()
+            QTimer.singleShot(180, QApplication.beep)
+            QTimer.singleShot(360, QApplication.beep)
             QMessageBox.critical(
                 self,
                 "EMERGENCY FALL ALERT",
-                f"{alert_message}\n\nDemo mode: triggered by a strong MPU6050 shake.",
+                f"{alert_message}\n\nDetected from a low-gravity/impact movement sequence.",
             )
         elif message.startswith("ALERT:"): self._add_alert("ESP32",message.split(":",1)[1],"Critical")
         elif message == "STATUS:DS18B20:ONLINE":
